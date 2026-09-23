@@ -79,6 +79,28 @@ test('never-enabled legacy hook records pick up new defaults but restarted tasks
   assert.equal(first3.frequency.toolMin, 60); assert.equal(first3.frequency.toolMax, 100);
 });
 
+test('environment variables MODELTRACE_TOOL_MIN, MODELTRACE_TOOL_MAX, and MODELTRACE_RETRY_COUNT configure new task defaults, while CLI flags take precedence', async (t) => {
+  const dir1 = await fixture(t);
+  const startedWithEnv = await run(['start', ...flags(dir1)], {
+    MODELTRACE_TOOL_MIN: '45',
+    MODELTRACE_TOOL_MAX: '75',
+    MODELTRACE_RETRY_COUNT: '5',
+  });
+  assert.equal(startedWithEnv.frequency.toolMin, 45);
+  assert.equal(startedWithEnv.frequency.toolMax, 75);
+  assert.equal(startedWithEnv.frequency.retryCount, 5);
+
+  const dir2 = await fixture(t);
+  const startedWithCliOverride = await run(['start', ...flags(dir2), '--tool-min', '20', '--retry-count', '2'], {
+    MODELTRACE_TOOL_MIN: '45',
+    MODELTRACE_TOOL_MAX: '75',
+    MODELTRACE_RETRY_COUNT: '5',
+  });
+  assert.equal(startedWithCliOverride.frequency.toolMin, 20);
+  assert.equal(startedWithCliOverride.frequency.toolMax, 75);
+  assert.equal(startedWithCliOverride.frequency.retryCount, 2);
+});
+
 test('only work-tool thresholds schedule probes; elapsed time cannot make a checkpoint due', () => {
   const state = newState(session, 1000);
   schedule(state, 1000, minimum);

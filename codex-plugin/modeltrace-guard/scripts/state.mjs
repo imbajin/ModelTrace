@@ -13,6 +13,23 @@ export const DEFAULTS = Object.freeze({
   pendingSeconds: 180,
   languages: ['zh', 'en'],
 });
+
+export function getEnvConfig(env = process.env) {
+  const config = {};
+  if (env?.MODELTRACE_TOOL_MIN !== undefined && env?.MODELTRACE_TOOL_MIN !== '') {
+    const val = Number(env.MODELTRACE_TOOL_MIN);
+    if (Number.isSafeInteger(val) && val >= 1) config.toolMin = val;
+  }
+  if (env?.MODELTRACE_TOOL_MAX !== undefined && env?.MODELTRACE_TOOL_MAX !== '') {
+    const val = Number(env.MODELTRACE_TOOL_MAX);
+    if (Number.isSafeInteger(val) && val >= 1) config.toolMax = val;
+  }
+  if (env?.MODELTRACE_RETRY_COUNT !== undefined && env?.MODELTRACE_RETRY_COUNT !== '') {
+    const val = Number(env.MODELTRACE_RETRY_COUNT);
+    if (Number.isSafeInteger(val) && val >= 1 && val <= 100) config.retryCount = val;
+  }
+  return config;
+}
 export const WARNING = 'Closed-set fingerprint evidence for a fork continuation; not backend authentication. Frozen-rollout and multilingual error rates have not been independently measured.';
 export const digest = (value) => createHash('sha256').update(value).digest('hex');
 

@@ -10,7 +10,7 @@ import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
 export { summarize } from './status.mjs';
 import {
-  DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, issue,
+  DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, getEnvConfig, issue,
   readState, recentComparable, record, schedule, segment, setTaskName, setTurn, validateConfig, validateNumbers, withState, workspaceName,
   interruptConfirmation, updateConfirmation, processAlive, BACKGROUND_STATE_LOCK,
 } from './state.mjs';
@@ -438,7 +438,8 @@ export async function run(args, env = process.env, receipt = null) {
       && ((state.config.toolMin === 8 && state.config.toolMax === 16) || (state.config.toolMin === 16 && state.config.toolMax === 32) || (state.config.toolMin === 100 && state.config.toolMax === 100))) {
       state.config = { ...state.config, toolMin: DEFAULTS.toolMin, toolMax: DEFAULTS.toolMax };
     }
-    state.config = validateConfig(patch, state.config);
+    const envPatch = command === 'start' && !state.startedAt ? getEnvConfig(env) : {};
+    state.config = validateConfig({ ...envPatch, ...patch }, state.config);
     const newExpected = options.expected;
     let changedExpected = false;
     if (newExpected !== undefined) {
