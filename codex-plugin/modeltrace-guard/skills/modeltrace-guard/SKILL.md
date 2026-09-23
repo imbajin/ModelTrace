@@ -20,7 +20,7 @@ Run `node <guard> doctor` to verify bundled files. `doctor --fork true` addition
 Run `start` with only the requested overrides:
 
 - `--expected <exact-label>` sets the comparison label; `--expected auto` follows Codex metadata. `models` lists bank labels. Missing metadata and a nonempty unlisted model are different outcomes; neither is a mismatch.
-- `--tool-min 16 --tool-max 32` sets a random interval of observed work-tool completions (the default). Equal values fix the interval. Existing tasks retain their saved intervals until configured. No elapsed-time scheduling or turn/task count caps.
+- `--tool-min 60 --tool-max 100` sets a random interval of observed work-tool completions (the default). Equal values fix the interval. Existing tasks retain their saved intervals until configured. No elapsed-time scheduling or turn/task count caps.
 - `--retry-count 3` sets additional tests after an initial mismatch; default 3, allowed 1–100. A request such as “复测改成 5 次” maps to `configure --retry-count 5`.
 - `--pending-seconds 180` is the issuance-to-completion deadline, not sampling frequency. Changes apply only to newly issued checkpoints.
 - `--languages zh,en,ja,ko,fr,de,es,pt,ru,ar` selects the random language pool. Default `zh,en`; one language fixes it.

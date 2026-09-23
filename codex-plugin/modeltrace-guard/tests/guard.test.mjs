@@ -43,12 +43,12 @@ test('frequency is tools-only and retry count defaults to 3 with configurable bo
   for (const patch of [{ mode: 'time' }, { mode: 'either' }, { mode: 'both' }, { mode: 'background' }, { toolMin: 0 }, { secondsMin: -1 }, { toolMin: 4, toolMax: 2 }, { secondsMin: 1000, secondsMax: 3 }, { retryCount: 0 }, { retryCount: 101 }, { retryCount: 2.5 }, { retryCount: '3' }, { maxPerTurn: 50, maxPerSession: 40 }, { maxPerSession: 1001 }, { toolMin: NaN }, { toolMax: 2.5 }, { rogue: 1 }, { languages: [] }, { languages: ['xx'] }, { languages: ['en', 'en'] }]) assert.throws(() => validateConfig(patch));
 });
 
-test('new tasks default to 16–32 work tools without overwriting saved custom intervals', async (t) => {
-  assert.equal(DEFAULTS.toolMin, 16); assert.equal(DEFAULTS.toolMax, 32);
-  assert.equal(validateConfig({}).toolMin, 16); assert.equal(validateConfig({}).toolMax, 32);
+test('new tasks default to 60–100 work tools without overwriting saved custom intervals', async (t) => {
+  assert.equal(DEFAULTS.toolMin, 60); assert.equal(DEFAULTS.toolMax, 100);
+  assert.equal(validateConfig({}).toolMin, 60); assert.equal(validateConfig({}).toolMax, 100);
   const directory = await fixture(t);
   const started = await run(['start', ...flags(directory)], {});
-  assert.equal(started.frequency.toolMin, 16); assert.equal(started.frequency.toolMax, 32);
+  assert.equal(started.frequency.toolMin, 60); assert.equal(started.frequency.toolMax, 100);
   assert.equal(started.probesIssued, 1);
   for (const [toolMin, toolMax] of [[8, 16], [30, 60], [40, 40]]) {
     await run(['configure', ...flags(directory), '--tool-min', String(toolMin), '--tool-max', String(toolMax)], {});
@@ -62,11 +62,21 @@ test('never-enabled legacy hook records pick up new defaults but restarted tasks
   const dir = await fixture(t);
   await withState(dir, session, (state) => { state.config.toolMin = 8; state.config.toolMax = 16; });
   const first = await run(['start', ...flags(dir)], {});
-  assert.equal(first.frequency.toolMin, 16); assert.equal(first.frequency.toolMax, 32);
+  assert.equal(first.frequency.toolMin, 60); assert.equal(first.frequency.toolMax, 100);
   await run(['configure', ...flags(dir), '--tool-min', '8', '--tool-max', '16'], {});
   await run(['stop', ...flags(dir)], {});
   const restarted = await run(['start', ...flags(dir)], {});
   assert.equal(restarted.frequency.toolMin, 8); assert.equal(restarted.frequency.toolMax, 16);
+
+  const dir2 = await fixture(t);
+  await withState(dir2, session, (state) => { state.config.toolMin = 16; state.config.toolMax = 32; });
+  const first2 = await run(['start', ...flags(dir2)], {});
+  assert.equal(first2.frequency.toolMin, 60); assert.equal(first2.frequency.toolMax, 100);
+
+  const dir3 = await fixture(t);
+  await withState(dir3, session, (state) => { state.config.toolMin = 100; state.config.toolMax = 100; });
+  const first3 = await run(['start', ...flags(dir3)], {});
+  assert.equal(first3.frequency.toolMin, 60); assert.equal(first3.frequency.toolMax, 100);
 });
 
 test('only work-tool thresholds schedule probes; elapsed time cannot make a checkpoint due', () => {

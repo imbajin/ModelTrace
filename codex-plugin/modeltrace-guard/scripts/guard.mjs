@@ -1,9 +1,11 @@
 import { randomInt } from 'node:crypto';
+import { existsSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LANGUAGES } from './prompts.mjs';
-import { acknowledgeAlerts, pendingAlerts, queueAlert, userNotice } from './alerts.mjs';
+import { acknowledgeAlerts, pendingAlerts, queueAlert, queueTelemetryAlert, userNotice } from './alerts.mjs';
+import { checkSqliteLatest } from './sqlite-checker.mjs';
 import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
 export { summarize } from './status.mjs';
@@ -63,7 +65,7 @@ function ownCommand(event) {
   if (!['Bash', 'exec_command', 'shell_command'].includes(event.tool_name)) return false;
   const input = event.tool_input;
   const command = typeof input === 'string' ? input : input?.cmd || input?.command || '';
-  return /guard\.mjs['"\s]+(?:start|submit|probe|wait|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label)\b/.test(command);
+  return /guard\.mjs['"\s]+(?:start|submit|probe|wait|configure|status|stop|resume|doctor|models|acknowledge|dashboard|dashboard-stop|label|check-sqlite)\b/.test(command);
 }
 
 // No substring exemption: `echo "guard.mjs status"; dangerous-command` must not
@@ -77,7 +79,7 @@ export function isControlCommand(event) {
   const tokens = words.map((word) => word.replace(/^(['"])(.*)\1$/, '$2'));
   if (tokens.length < 3 || !/^(?:node(?:\.exe)?|.*[\\/]node(?:\.exe)?)$/i.test(tokens[0])) return false;
   if (path.resolve(tokens[1]) !== path.join(ROOT, 'scripts', 'guard.mjs')) return false;
-  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'probe', 'doctor', 'dashboard', 'dashboard-stop'].includes(tokens[2])) return false;
+  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'probe', 'doctor', 'dashboard', 'dashboard-stop', 'check-sqlite'].includes(tokens[2])) return false;
   try { parseArguments(tokens.slice(2)); return true; } catch { return false; }
 }
 
@@ -150,6 +152,31 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
         if (!oldModel && state.enabled) record(state, 'model_label_observed', now, { model: event.model });
         if (state.enabled && oldModel) segment(state, now, 'reported_model_changed', draw);
       }
+    }
+    if (state.enabled && ['UserPromptSubmit', 'Stop'].includes(hook)) {
+      try {
+        const telemetry = await checkSqliteLatest({
+          sessionId: event.session_id,
+          expectedModel: state.expected || state.model,
+          lastLogId: state.lastSqliteLogId,
+        });
+        if (telemetry?.record) {
+          state.lastSqliteLogId = Math.max(state.lastSqliteLogId || 0, telemetry.record.logId);
+          state.lastTelemetry = {
+            at: now,
+            logId: telemetry.record.logId,
+            requestedModel: telemetry.record.requestedModel,
+            fasterModel: telemetry.record.fasterModel,
+            safetyBufferingEnabled: telemetry.record.safetyBufferingEnabled,
+            primaryUsedPercent: telemetry.record.primaryUsedPercent,
+            degraded: telemetry.degraded,
+            reason: telemetry.reason,
+          };
+          if (telemetry.degraded) {
+            queueTelemetryAlert(state, telemetry.record, now);
+          }
+        }
+      } catch {}
     }
     const turnKey = state.turn || 'no-turn';
     const waiting = pendingAlerts(state);
@@ -239,7 +266,7 @@ function parseArguments(args) {
   }
   const fields = ['mode', 'tool-min', 'tool-max', 'retry-count', 'pending-seconds', 'languages'];
   const perCommand = {
-    help: [], doctor: ['fork'], models: [], hook: [], 'background-hook': [], wait: ['confirmation'], status: [], stop: [], resume: ['halt'], dashboard: [], 'dashboard-stop': [], acknowledge: ['alert'], label: ['name'],
+    help: [], doctor: ['fork'], models: [], hook: [], 'background-hook': [], wait: ['confirmation'], status: [], stop: [], resume: ['halt'], dashboard: [], 'dashboard-stop': [], acknowledge: ['alert'], label: ['name'], 'check-sqlite': ['expected', 'db'],
     start: ['expected', 'name', ...fields], configure: ['expected', 'name', ...fields], submit: ['challenge', 'numbers'], probe: ['challenge'],
   };
   if (!Object.hasOwn(perCommand, command)) throw new Error(`Unknown command: ${command}`);
@@ -266,7 +293,7 @@ export async function run(args, env = process.env, receipt = null) {
   const { command, options, fields } = parseArguments([...args]);
   const directory = dataDirectory(options['data-dir'], env);
   if (command === 'help') return {
-    commands: ['start', 'configure', 'probe', 'wait', 'status', 'stop', 'resume', 'doctor', 'models', 'acknowledge', 'dashboard', 'dashboard-stop', 'label'],
+    commands: ['start', 'configure', 'probe', 'wait', 'status', 'stop', 'resume', 'doctor', 'models', 'acknowledge', 'dashboard', 'dashboard-stop', 'label', 'check-sqlite'],
     execution: 'Native async hooks run probes in the background. Normal results are silent; wait is only for an active mismatch confirmation.',
     name: 'start --name <task title> or label --name <display name>; metadata only, does not rename the Codex task or change sampling',
     session: 'Defaults to CODEX_THREAD_ID; otherwise pass --session from a trusted hook. Never invent a task id.',
@@ -305,6 +332,15 @@ export async function run(args, env = process.env, receipt = null) {
     const selected = options.session || env.CODEX_THREAD_ID;
     if (selected && (selected.length > 256 || /[\x00-\x1f]/.test(selected))) throw new Error('Invalid session ID');
     return launchDashboard(directory, selected);
+  }
+  if (command === 'check-sqlite') {
+    return checkSqliteLatest({
+      dbPath: options.db,
+      sessionId: options.session || env.CODEX_THREAD_ID,
+      expectedModel: options.expected,
+      allowGlobalFallback: !options.session && !env.CODEX_THREAD_ID,
+      env,
+    });
   }
   const session = options.session || env.CODEX_THREAD_ID;
   if (!session || session.length > 256 || /[\x00-\x1f]/.test(session)) throw new Error('No valid current session: use CODEX_THREAD_ID or --session from the hook');
@@ -397,9 +433,9 @@ export async function run(args, env = process.env, receipt = null) {
     state.workspaceName ||= workspaceName(process.cwd());
     // Hooks may have created a disabled record before the plugin was updated.
     // Its old default is not a user-selected interval. Actual prior monitoring
-    // keeps its saved configuration, including an explicit 8–16 interval.
+    // keeps its saved configuration, including an explicit 8–16, 16–32 or 100 interval.
     if (command === 'start' && !state.enabled && !state.enabledAt && !state.startedAt && !state.issued && !state.samples.length
-      && state.config.toolMin === 8 && state.config.toolMax === 16) {
+      && ((state.config.toolMin === 8 && state.config.toolMax === 16) || (state.config.toolMin === 16 && state.config.toolMax === 32) || (state.config.toolMin === 100 && state.config.toolMax === 100))) {
       state.config = { ...state.config, toolMin: DEFAULTS.toolMin, toolMax: DEFAULTS.toolMax };
     }
     state.config = validateConfig(patch, state.config);
@@ -437,4 +473,11 @@ export async function main(args = process.argv.slice(2)) {
   finally { dispatchQueuedCleanups(); }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
+const isDirectCall = (entryUrl) => {
+  if (!process.argv[1]) return false;
+  const target = fileURLToPath(entryUrl);
+  if (path.resolve(process.argv[1]) === target) return true;
+  try { return existsSync(process.argv[1]) && realpathSync(process.argv[1]) === target; } catch { return false; }
+};
+
+if (isDirectCall(import.meta.url)) await main();

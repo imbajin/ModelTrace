@@ -21,8 +21,44 @@ export function queueAlert(state, sample) {
 
 export const pendingAlerts = (state) => (state?.alerts || []).filter((alert) => !alert.acknowledgedAt);
 
+export function queueTelemetryAlert(state, telemetry, now = Date.now()) {
+  state.alerts ||= [];
+  const id = `telemetry-${telemetry.logId || now}`;
+  const existing = state.alerts.find((alert) => alert.id === id);
+  if (existing) return existing;
+  const alert = {
+    id, at: now, epoch: state.epoch || 1, level: 'telemetry_downgrade',
+    expected: state.expected || state.model || telemetry.requestedModel,
+    prediction: telemetry.fasterModel || 'unknown_faster_model',
+    reportedModel: state.model || telemetry.requestedModel,
+    details: {
+      logId: telemetry.logId,
+      fasterModel: telemetry.fasterModel,
+      usedPercent: telemetry.primaryUsedPercent,
+      reason: telemetry.reason,
+    },
+    acknowledgedAt: null, deliveryCount: 0, lastDeliveredAt: null, lastDeliveryTurn: null,
+  };
+  state.alerts.push(alert);
+  record(state, 'telemetry_downgrade_alert', now, {
+    alert: alert.id,
+    logId: telemetry.logId,
+    requestedModel: telemetry.requestedModel,
+    fasterModel: telemetry.fasterModel,
+    safetyBufferingEnabled: telemetry.safetyBufferingEnabled,
+    primaryUsedPercent: telemetry.primaryUsedPercent,
+    reason: telemetry.reason,
+  });
+  return alert;
+}
+
 export function userNotice(alert) {
   if (alert.level === 'confirmed_mismatch') return `ModelTrace Guard：首次异常后的 ${alert.retryCount} 次复测全部与预期模型 ${JSON.stringify(alert.expected)} 不一致。复测第一候选依次为 ${JSON.stringify(alert.predictions || [alert.prediction])}。已要求智能体立刻停止原任务并告知用户，等待用户决定后续操作。`;
+  if (alert.level === 'telemetry_downgrade') {
+    const used = alert.details?.usedPercent !== undefined && alert.details?.usedPercent !== null ? `，额度已用 ${alert.details.usedPercent}%` : '';
+    const reasonText = alert.details?.reason ? `（${alert.details.reason}）` : '';
+    return `ModelTrace Guard 警报：本地 SQLite 遥测发现服务端降级指令${reasonText}。预期模型为 ${JSON.stringify(alert.expected)}，降级分流至 ${JSON.stringify(alert.prediction)}${used}。已触发 fast-fail 阻断工具执行，请切换节点或调整配置。`;
+  }
   const strength = { candidate_mismatch: '候选排序不一致，但证据不足', difference_signal: '一次较强的指纹差异线索', repeated_difference: '近期重复的同语言指纹差异线索' }[alert.level];
   return `ModelTrace Guard 提醒：${new Date(alert.at).toISOString()} 的抽样中，预期模型为 ${JSON.stringify(alert.expected)}，指纹第一候选为 ${JSON.stringify(alert.prediction)}（${strength}）。这是未独立校准的实验性结果，不能据此确认模型被替换、降智或厂商作弊；后续匹配也不会抹去本次记录。`;
 }

@@ -42,6 +42,7 @@ export function summarize(state, directory, now = Date.now()) {
     differenceSignals: (state.history?.samples?.differenceSignals || 0) + state.samples.filter((p) => ['difference_signal', 'repeated_difference'].includes(p.outcome)).length,
     mismatchAlerts: historyCount(state, 'alerts'), pendingNotifications: pendingAlerts(state).length,
     notifications: (state.alerts || []).slice(-5),
+    lastTelemetry: state.lastTelemetry || null,
     latest: state.samples.slice(-3).map(publicSample),
     stateFile: sessionPath(directory, state.session), warning: WARNING,
     coverageNote: 'Normal checkpoints use work-tool counts only, with no per-turn or task-total probe limit. Mismatch retries are consecutive and bounded by retryCount. Only sampled continuations are observed.',

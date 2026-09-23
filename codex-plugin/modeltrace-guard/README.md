@@ -35,7 +35,7 @@ codex plugin add modeltrace-guard@modeltrace
 
 对目标任务说：
 
-> 使用 $modeltrace-guard 为本任务开启监测，每隔 16–32 次工作工具调用检测，异常后复测 3 次，使用中文和英语。
+> 使用 $modeltrace-guard 为本任务开启监测，每隔 60–100 次工作工具调用检测，异常后复测 3 次，使用中文和英语。
 
 > 把复测次数改成 5 次。
 
@@ -46,7 +46,7 @@ codex plugin add modeltrace-guard@modeltrace
 ```powershell
 node scripts/guard.mjs doctor
 node scripts/guard.mjs doctor --fork true
-node scripts/guard.mjs start --tool-min 16 --tool-max 32 --retry-count 3 --languages zh,en
+node scripts/guard.mjs start --tool-min 60 --tool-max 100 --retry-count 3 --languages zh,en
 node scripts/guard.mjs configure --retry-count 5
 node scripts/guard.mjs status
 node scripts/guard.mjs dashboard
@@ -59,14 +59,14 @@ node scripts/guard.mjs stop
 
 | 设置 | 默认与含义 |
 | --- | --- |
-| `--tool-min N --tool-max M` | 16–32 次观察到的工作工具完成；N=M 固定间隔 |
+| `--tool-min N --tool-max M` | 60–100 次观察到的工作工具完成；N=M 固定间隔 |
 | `--retry-count N` | 首次不一致后额外复测，默认 3，允许 1–100 |
 | `--pending-seconds N` | 从发出探针到完成评分的时限，默认 180 秒，不是检测间隔 |
 | `--languages zh,en,...` | 默认中英；支持 zh/en/ja/ko/fr/de/es/pt/ru/ar，单项固定语言 |
 
 没有每轮或任务累计探针数量上限。普通检查按工具间隔进行，空闲不启动新采样，已开始的后台检查可在本轮回答结束后完成。同一任务最多一个在途探针；多个工具同时完成不会重复发起。修改设置不清空历史；当前复测组保持创建时的配置。
 
-升级保留已有任务保存的间隔。要调整已开启任务，可在仪表盘保存 16–32，或对该任务说“把探测间隔改成 16–32 次工具调用”。
+升级保留已有任务保存的间隔。要调整已开启任务，可在仪表盘保存 60–100，或对该任务说“把探测间隔改成 60–100 次工具调用”。
 
 仪表盘按任务区分监测状态，不按工作目录合并。首次后台快照会从 Codex 任务元数据读取真实标题，用户自定义名称优先；标题暂不可用时显示“未命名任务（工作目录）”及时间。列表同时保留已停止任务的历史记录，并标明开关状态。打开页面或选择任务不会开启探测。
 
