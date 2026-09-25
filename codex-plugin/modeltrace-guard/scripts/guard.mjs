@@ -200,6 +200,24 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     // Old lifecycle events cannot reset the current runtime, but a persistent
     // halt or undelivered alert must remain visible even to a stale callback.
     if (!currentTurn && !['PreToolUse', 'PostToolUse'].includes(hook)) return deliver({});
+    // 核心改进：无论会话当前是否处于显式 enabled 状态，
+    // 只要执行了工具，必须如实累加工具调用计数 workTools 并初始化 nextTools。
+    // 彻底解决原版在第 205 行因 !state.enabled 提前 return 导致 workTools 永远为 0、永不采样的漏洞。
+    if (hook === 'PostToolUse' && !ownCommand(event)) {
+      if (event.tool_use_id && state.seenTools.includes(event.tool_use_id)) return deliver({});
+      if (event.tool_use_id) state.seenTools = [...state.seenTools.slice(-255), event.tool_use_id];
+      state.workTools += 1;
+      state.lastWorkHookAt = now;
+      if (state.nextTools === null) {
+        schedule(state, now, draw);
+      }
+      // 当工具调用累加达到阈值（150~300），且未被用户显式 stop 停用时，自动激活监控触发抽样
+      if (!state.enabled && !state.disabledByUser && state.nextTools !== null && state.workTools >= state.nextTools) {
+        state.enabled = true;
+        state.enabledAt = now;
+        state.startedAt ||= now;
+      }
+    }
     // Notifications survive stop, compaction and plugin upgrades. Disabling new
     // sampling must not make an already detected discrepancy disappear.
     if (!state.enabled && hook !== 'Stop') return deliver({});
@@ -229,14 +247,6 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       segment(state, now, 'resumed_after_interrupted_compaction', draw);
     }
     if (state.compacting) return {};
-    if (hook === 'PostToolUse' && !ownCommand(event)) {
-      // Management tools do not count toward the interval, but their background
-      // hook must still pick up the checkpoint queued by start/acknowledge.
-      if (event.tool_use_id && state.seenTools.includes(event.tool_use_id)) return deliver({});
-      if (event.tool_use_id) state.seenTools = [...state.seenTools.slice(-255), event.tool_use_id];
-      state.workTools += 1;
-      state.lastWorkHookAt = now;
-    }
     const expired = expirePending(state, now);
     if (hook === 'Stop') {
       if (event.stop_hook_active || state.stopTurn === (state.turn || 'no-turn')) {
@@ -423,12 +433,16 @@ export async function run(args, env = process.env, receipt = null) {
       abandon(state, now, 'monitoring_stopped');
       interruptConfirmation(state, now, 'monitoring_stopped');
       state.enabled = false;
+      state.disabledByUser = true; // 用户显式停止监控，避免达到阈值时被自动重新激活
       if (!state.probeRun) { await removeSnapshot(directory, state.forkSnapshot); state.forkSnapshot = null; }
       record(state, 'monitoring_stopped', now);
       return summarize(state, directory, now);
     }
     if (command === 'configure' && !state.enabled) throw new Error('Monitoring is not active; start it first');
-    if (command === 'start') state.runtimePaused = false;
+    if (command === 'start') {
+      state.disabledByUser = false;
+      state.runtimePaused = false;
+    }
     if (options.name !== undefined) setTaskName(state, options.name, now);
     state.workspaceName ||= workspaceName(process.cwd());
     // Hooks may have created a disabled record before the plugin was updated.
