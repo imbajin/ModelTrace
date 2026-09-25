@@ -449,7 +449,7 @@ export async function run(args, env = process.env, receipt = null) {
     // Its old default is not a user-selected interval. Actual prior monitoring
     // keeps its saved configuration, including an explicit 8–16, 16–32 or 100 interval.
     if (command === 'start' && !state.enabled && !state.enabledAt && !state.startedAt && !state.issued && !state.samples.length
-      && ((state.config.toolMin === 8 && state.config.toolMax === 16) || (state.config.toolMin === 16 && state.config.toolMax === 32) || (state.config.toolMin === 20 && state.config.toolMax === 60) || (state.config.toolMin === 60 && state.config.toolMax === 100) || (state.config.toolMin === 100 && state.config.toolMax === 100))) {
+      && ((state.config.toolMin === 8 && state.config.toolMax === 16) || (state.config.toolMin === 16 && state.config.toolMax === 32) || (state.config.toolMin === 20 && state.config.toolMax === 60) || (state.config.toolMin === 60 && state.config.toolMax === 100) || (state.config.toolMin === 100 && state.config.toolMax === 100) || (state.config.toolMin === 150 && state.config.toolMax === 300))) {
       state.config = { ...state.config, toolMin: DEFAULTS.toolMin, toolMax: DEFAULTS.toolMax };
     }
     const envPatch = command === 'start' && !state.startedAt ? getEnvConfig(env) : {};
