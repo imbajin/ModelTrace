@@ -9,7 +9,7 @@ import { removeSnapshot } from './fork-snapshot.mjs';
 export { validateNumbers } from './probe-output.mjs';
 
 export const DEFAULTS = Object.freeze({
-  mode: 'tools', toolMin: 20, toolMax: 60, retryCount: 3,
+  mode: 'tools', toolMin: 150, toolMax: 300, retryCount: 3,
   pendingSeconds: 180,
   languages: ['zh', 'en'],
 });
