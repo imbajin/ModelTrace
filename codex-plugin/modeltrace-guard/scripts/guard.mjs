@@ -211,8 +211,12 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       if (state.nextTools === null) {
         schedule(state, now, draw);
       }
-      // 当工具调用累加达到阈值（150~300），且未被用户显式 stop 停用时，自动激活监控触发抽样
-      if (!state.enabled && !state.disabledByUser && state.nextTools !== null && state.workTools >= state.nextTools) {
+      // 默认仅运行轻量级 SQLite 遥测（0 Token/Prompt 开销）。
+      // 仅当显式设置 MODELTRACE_AUTO_ACTIVATE=true 时，才在工具调用达到阈值时自动激活后台 fork 探针；
+      // 用户亦可随时通过 `guard.mjs start` 或对智能体请求手动开启探针。
+      const allowAutoActivate = (process.env.MODELTRACE_AUTO_ACTIVATE === 'true' || process.env.MODELTRACE_AUTO_ACTIVATE === '1')
+        && process.env.MODELTRACE_SQLITE_ONLY !== 'true';
+      if (allowAutoActivate && !state.enabled && !state.disabledByUser && state.nextTools !== null && state.workTools >= state.nextTools) {
         state.enabled = true;
         state.enabledAt = now;
         state.startedAt ||= now;
