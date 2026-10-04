@@ -52,7 +52,7 @@ async function submitPending(dir) {
 }
 
 test('default three extra retries follow immediate notification and end in a persistent halt', async (t) => {
-  const { dir, initial } = await startMismatch(t);
+  const { dir, initial } = await startMismatch(t, ['--retry-count', '3']);
   assert.equal(initial.confirmation.target, 3);
   assert.match(initial.notificationContext, /NOTIFY THE USER NOW/);
   assert.match(initial.controlContext, /3 background follow-up probes/);
@@ -102,7 +102,7 @@ for (const retryCount of [1, 5]) test(`user-configured ${retryCount} additional 
 });
 
 test('retry-count and language changes apply to the next batch; current comparisons stay fixed', async (t) => {
-  const { dir, initial } = await startMismatch(t);
+  const { dir, initial } = await startMismatch(t, ['--retry-count', '3']);
   const updated = await command(dir, 'configure', '--retry-count', '7', '--languages', 'ja');
   assert.equal(updated.frequency.retryCount, 7);
   assert.equal(updated.confirmation.target, 3); assert.equal(updated.confirmation.language, 'en');
@@ -158,7 +158,7 @@ test('matching retry automatically returns the next retry without requiring a no
   const result = await submitPending(dir);
   assert.equal(result.sample.prediction, expected); assert.equal(result.notification, null);
   assert.equal(result.confirmation.results.length, 1); assert.equal(result.confirmation.results[0].mismatch, false);
-  assert.equal(result.agentAction, 'complete_retries'); assert.match(result.challengeContext, /retry 2\/3/);
+  assert.equal(result.agentAction, 'complete_retries'); assert.match(result.challengeContext, /retry 2\/2/);
   assert.equal((await readState(dir, session)).pending.retryIndex, 2);
 });
 
@@ -276,7 +276,7 @@ test('retired time/cap migration preserves history and counters and only runs on
   await writeFile(sessionPath(dir, session), JSON.stringify(state));
   const before = await readFile(sessionPath(dir, session), 'utf8');
   const status = await command(dir, 'status');
-  assert.equal(status.frequency.retryCount, 3); assert.equal(status.frequency.mode, 'tools');
+  assert.equal(status.frequency.retryCount, 2); assert.equal(status.frequency.mode, 'tools');
   assert.equal(status.frequency.maxPerTurn, undefined); assert.equal(status.frequency.maxPerSession, undefined);
   assert.equal(status.fingerprintDisplayStatus, 'missing_expected_model');
   assert.equal(await readFile(sessionPath(dir, session), 'utf8'), before);

@@ -36,10 +36,10 @@ async function active(directory, now = Date.now()) {
 }
 const flags = (directory) => ['--session', session, '--data-dir', directory];
 
-test('frequency is tools-only and retry count defaults to 3 with configurable bounds', () => {
+test('frequency is tools-only and retry count defaults to 2 with configurable bounds', () => {
   assert.equal(validateConfig({}).mode, 'tools');
-  assert.equal(validateConfig({}).retryCount, 3);
-  for (const retryCount of [1, 3, 5, 100]) assert.equal(validateConfig({ retryCount }).retryCount, retryCount);
+  assert.equal(validateConfig({}).retryCount, 2);
+  for (const retryCount of [1, 2, 3, 5, 100]) assert.equal(validateConfig({ retryCount }).retryCount, retryCount);
   for (const patch of [{ mode: 'time' }, { mode: 'either' }, { mode: 'both' }, { mode: 'background' }, { toolMin: 0 }, { secondsMin: -1 }, { toolMin: 4, toolMax: 2 }, { secondsMin: 1000, secondsMax: 3 }, { retryCount: 0 }, { retryCount: 101 }, { retryCount: 2.5 }, { retryCount: '3' }, { maxPerTurn: 50, maxPerSession: 40 }, { maxPerSession: 1001 }, { toolMin: NaN }, { toolMax: 2.5 }, { rogue: 1 }, { languages: [] }, { languages: ['xx'] }, { languages: ['en', 'en'] }]) assert.throws(() => validateConfig(patch));
 });
 

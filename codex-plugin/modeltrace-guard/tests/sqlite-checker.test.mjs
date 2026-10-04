@@ -13,7 +13,7 @@ import {
   getDefaultDbPath,
 } from '../scripts/sqlite-checker.mjs';
 import { queueTelemetryAlert, userNotice, pendingAlerts, acknowledgeAlerts } from '../scripts/alerts.mjs';
-import { handleHook, ROOT, isControlCommand } from '../scripts/guard.mjs';
+import { handleHook, ROOT, isControlCommand, run } from '../scripts/guard.mjs';
 import { handleBackgroundHook } from '../scripts/background.mjs';
 import { newState, withState, readState } from '../scripts/state.mjs';
 
@@ -366,7 +366,7 @@ test('handleHook fast-fails on PreToolUse when SQLite records server-side degrad
     1008
   );
   assert.equal(stopWithNewDegradation.decision, 'block');
-  assert.ok(stopWithNewDegradation.systemMessage?.includes('本地 SQLite 遥测发现服务端降级指令'));
+  assert.ok(stopWithNewDegradation.systemMessage?.includes('服务端降级指令'));
   const stateAfterStop = await readState(dataDir, sessionId);
   assert.equal(stateAfterStop.lastSqliteLogId, 51);
 });
@@ -475,3 +475,60 @@ test('checkSqliteLatest resolves relative paths correctly', async (t) => {
   assert.equal(res.record?.logId, 5);
   assert.equal(res.degraded, false);
 });
+
+test('two consecutive telemetry degradations trigger taskHalt hard stop', async (t) => {
+  const dir = await tempDir(t);
+  const dbFile = path.join(dir, 'halt_logs.sqlite');
+  initTestDb(dbFile);
+  const dataDir = path.join(dir, 'data');
+  const sessionId = 'session-consecutive-halt';
+  const originalDb = process.env.CODEX_LOGS_DB;
+  process.env.CODEX_LOGS_DB = dbFile;
+  t.after(() => {
+    if (originalDb === undefined) delete process.env.CODEX_LOGS_DB;
+    else process.env.CODEX_LOGS_DB = originalDb;
+  });
+
+  // 初始化会话
+  await handleHook({ session_id: sessionId, hook_event_name: 'SessionStart', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1000);
+
+  // 第 1 次降级 (UserPromptSubmit)
+  insertTestLog(dbFile, {
+    id: 101,
+    ts: 1789640001,
+    threadId: sessionId,
+    body: 'turn{thread.id=session-consecutive-halt model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}',
+  });
+  await handleHook({ session_id: sessionId, hook_event_name: 'UserPromptSubmit', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1001);
+  let state = await readState(dataDir, sessionId);
+  assert.equal(state.consecutiveDegradedCount, 1);
+  assert.equal(state.taskHalt, null);
+
+  // 第 2 次降级 (Stop) -> 立即触发 taskHalt
+  insertTestLog(dbFile, {
+    id: 102,
+    ts: 1789640002,
+    threadId: sessionId,
+    body: 'turn{thread.id=session-consecutive-halt model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}',
+  });
+  await handleHook({ session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1002);
+  state = await readState(dataDir, sessionId);
+  assert.equal(state.consecutiveDegradedCount, 2);
+  assert.ok(state.taskHalt);
+  assert.equal(state.taskHalt.source, 'telemetry');
+  assert.equal(state.taskHalt.retryCount, 2);
+  assert.equal(state.taskHalt.actual, 'gpt-6-luna');
+
+  // 后续 PreToolUse 必须被硬中断 deny 拦截
+  const preToolResult = await handleHook({ session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-2', model: 'gpt-6.1-sol', tool_name: 'Bash', tool_input: { command: 'ls' } }, dataDir, 1004);
+  assert.equal(preToolResult.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.ok(preToolResult.hookSpecificOutput?.permissionDecisionReason?.includes('STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER'));
+
+  // 验证用户 resume 命令能够解除 halt 并重置计数
+  const resumeResult = await run(['resume', '--session', sessionId, '--data-dir', dataDir, '--halt', state.taskHalt.id]);
+  assert.ok(resumeResult);
+  state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt, null);
+  assert.equal(state.consecutiveDegradedCount, 0);
+});
+

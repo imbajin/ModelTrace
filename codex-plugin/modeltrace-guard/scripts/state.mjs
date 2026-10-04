@@ -9,7 +9,7 @@ import { removeSnapshot } from './fork-snapshot.mjs';
 export { validateNumbers } from './probe-output.mjs';
 
 export const DEFAULTS = Object.freeze({
-  mode: 'tools', toolMin: 250, toolMax: 500, retryCount: 3,
+  mode: 'tools', toolMin: 250, toolMax: 500, retryCount: 2,
   pendingSeconds: 180,
   languages: ['zh', 'en'],
 });
@@ -56,6 +56,7 @@ export function newState(session, now = Date.now()) {
     lastSampleAt: null, maxObservedGapSeconds: 0, missed: 0, pending: null,
     seenTools: [], retiredTurns: [], stopTurn: null, forceProbe: false, samples: [], events: [], alerts: [],
     nextTools: null, nextAt: null, lastOutcome: 'not_started', confirmation: null, taskHalt: null,
+    consecutiveDegradedCount: 0,
     samplingMode: 'fork', forkSnapshot: null, probeRun: null, runtimeStartedAt: null, lastWorkHookAt: null, runtimeEndedAt: null,
     runtimePaused: false, lastBackgroundHookAt: null,
   };

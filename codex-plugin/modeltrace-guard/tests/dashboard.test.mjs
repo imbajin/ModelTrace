@@ -145,7 +145,7 @@ test('dashboard reads retired time/cap settings without rewriting evidence or sh
   await writeFile(sessionPath(dir, session), JSON.stringify(legacy));
   const before = await readFile(sessionPath(dir, session), 'utf8'), s = await serverFixture(t, dir);
   const view = await (await s.call(`/api/sessions/${digest(session)}`)).json();
-  assert.equal(view.frequency.mode, 'tools'); assert.equal(view.frequency.retryCount, 3);
+  assert.equal(view.frequency.mode, 'tools'); assert.equal(view.frequency.retryCount, 2);
   assert.equal(view.frequency.secondsMin, undefined); assert.equal(view.nextTimeCheckpoint, null);
   assert.equal(view.frequency.maxPerTurn, undefined); assert.equal(view.frequency.maxPerSession, undefined);
   assert.equal(view.status, 'hooks_unverified'); assert.equal(view.fingerprintDisplayStatus, 'difference_signal'); assert.equal(view.fingerprintStatus, 'difference_signal');

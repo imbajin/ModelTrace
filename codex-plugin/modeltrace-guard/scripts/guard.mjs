@@ -42,7 +42,12 @@ export function challengeContext(state, directory) {
 }
 
 export function controlContext(state, directory) {
-  if (state.taskHalt) return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. All ${state.taskHalt.retryCount} follow-up probes disagreed with the expected model ${JSON.stringify(state.taskHalt.expected)}. Stop edits, commands, delegation and other task work. Explain the initial alert and retry results in a final user-visible answer, then wait for the user's decision. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. This is a fingerprint comparison, not proof of backend identity. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
+  if (state.taskHalt) {
+    if (state.taskHalt.source === 'telemetry') {
+      return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. Local SQLite telemetry detected that the server continuously downgraded/diverted the model to ${JSON.stringify(state.taskHalt.actual || 'fallback model')} (${state.taskHalt.retryCount} consecutive checks, reason: ${state.taskHalt.reason || 'Safety Buffering'}). Stop edits, commands, delegation and other task work. Explain the persistent downgrade to the user, and advise the user to switch proxy nodes, switch models, or start a new session. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
+    }
+    return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. All ${state.taskHalt.retryCount} follow-up probes disagreed with the expected model ${JSON.stringify(state.taskHalt.expected)}. Stop edits, commands, delegation and other task work. Explain the initial alert and retry results in a final user-visible answer, then wait for the user's decision. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. This is a fingerprint comparison, not proof of backend identity. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
+  }
   const batch = state.confirmation;
   if (batch?.status === 'active') {
     const command = directory ? `\nnode ${quote(path.join(ROOT, 'scripts', 'guard.mjs'))} wait --session ${quote(state.session)} --data-dir ${quote(directory)} --confirmation ${quote(batch.id)}` : '';
@@ -173,7 +178,34 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
             reason: telemetry.reason,
           };
           if (telemetry.degraded) {
-            queueTelemetryAlert(state, telemetry.record, now);
+            state.consecutiveDegradedCount = (state.consecutiveDegradedCount || 0) + 1;
+            const threshold = Number(process.env.MODELTRACE_TELEMETRY_HALT_COUNT || 2);
+            const shouldHalt = state.consecutiveDegradedCount >= threshold;
+            if (shouldHalt && !state.taskHalt) {
+              state.taskHalt = {
+                id: `telemetry-halt-${telemetry.record.logId || now}`,
+                at: now,
+                source: 'telemetry',
+                expected: state.expected || state.model || telemetry.record.requestedModel,
+                actual: telemetry.record.fasterModel || 'unknown_faster_model',
+                retryCount: state.consecutiveDegradedCount,
+                reason: telemetry.reason,
+                alertId: `telemetry-${telemetry.record.logId || now}`,
+              };
+              record(state, 'task_halt_requested', now, { ...state.taskHalt });
+            }
+            queueTelemetryAlert(state, telemetry.record, now, {
+              consecutiveCount: state.consecutiveDegradedCount,
+              halted: Boolean(state.taskHalt),
+            });
+          } else {
+            if (state.consecutiveDegradedCount > 0) {
+              record(state, 'telemetry_recovered', now, {
+                logId: telemetry.record.logId,
+                previousCount: state.consecutiveDegradedCount,
+              });
+              state.consecutiveDegradedCount = 0;
+            }
           }
         }
       } catch {}
@@ -430,6 +462,7 @@ export async function run(args, env = process.env, receipt = null) {
       if (!state.taskHalt || options.halt !== state.taskHalt.id) throw new Error('Explicit user-approved resume requires the current halt ID');
       record(state, 'task_resumed', now, { halt: state.taskHalt.id });
       state.taskHalt = null;
+      state.consecutiveDegradedCount = 0;
       schedule(state, now);
       return summarize(state, directory, now);
     }

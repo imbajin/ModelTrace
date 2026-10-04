@@ -77,7 +77,7 @@ test('snapshot captures the native title using the existing summary read and pre
 
 test('initial probe and all three retries fork one immutable native base, never prior probe answers', async (t) => {
   const f = await fixture(t);
-  let pending = (await f.command('start', '--languages', 'en')).pending, base;
+  let pending = (await f.command('start', '--languages', 'en', '--retry-count', '3')).pending, base;
   for (let index = 0; index < 4; index++) {
     const result = await runForkProbe(f.directory, f.session, pending.id, {}, f.dependencies);
     assert.equal(result.accepted, true, result.reason); assert.equal(result.sample.numbers, undefined);
@@ -584,7 +584,7 @@ test('a queued background result rechecks expiry after acquiring the state lock'
 
 test('background mismatch notifies before retry, then three mismatching retries halt using one frozen base', async (t) => {
   const f = await fixture(t);
-  await f.command('start', '--languages', 'en');
+  await f.command('start', '--languages', 'en', '--retry-count', '3');
   const notification = await handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, f.dependencies);
   assert.ok(notification.systemMessage.includes(f.model));
   assert.ok(notification.hookSpecificOutput.additionalContext.includes('acknowledge --session'));
@@ -621,7 +621,7 @@ test('matching background retries advance automatically and release the work gua
     if (classify(text) !== classify(integers)) { matching = text; break; }
   }
   assert.ok(matching, 'fixture must offer two distinct predictions in the packaged bank');
-  await f.command('start', '--expected', classify(matching));
+  await f.command('start', '--expected', classify(matching), '--retry-count', '3');
   await handleBackgroundHook(managementEvent(f, 'start'), f.directory, {}, f.dependencies);
   const before = await readState(f.directory, f.session);
   await f.command('acknowledge', '--alert', before.alerts[0].id);
