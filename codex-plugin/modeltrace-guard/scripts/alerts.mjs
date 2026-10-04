@@ -21,14 +21,21 @@ export function queueAlert(state, sample) {
 
 export const pendingAlerts = (state) => (state?.alerts || []).filter((alert) => !alert.acknowledgedAt);
 
-export function queueTelemetryAlert(state, telemetry, now = Date.now(), { consecutiveCount = 1, halted = false } = {}) {
+export function queueTelemetryAlert(state, telemetry, now = Date.now(), { consecutiveCount = 1, halted = false, attempt = 1, pausedUntil = null, durationMinutes = 15, exhausted = false } = {}) {
   state.alerts ||= [];
   const id = `telemetry-${telemetry.logId || now}`;
   const existing = state.alerts.find((alert) => alert.id === id);
   if (existing) {
     if (halted) {
       existing.halted = true;
-      existing.details = { ...existing.details, consecutiveCount: Math.max(existing.details?.consecutiveCount || 1, consecutiveCount) };
+      existing.details = {
+        ...existing.details,
+        consecutiveCount: Math.max(existing.details?.consecutiveCount || 1, consecutiveCount),
+        attempt,
+        pausedUntil,
+        durationMinutes,
+        exhausted,
+      };
     }
     return existing;
   }
@@ -44,6 +51,10 @@ export function queueTelemetryAlert(state, telemetry, now = Date.now(), { consec
       usedPercent: telemetry.primaryUsedPercent,
       reason: telemetry.reason,
       consecutiveCount,
+      attempt,
+      pausedUntil,
+      durationMinutes,
+      exhausted,
     },
     acknowledgedAt: null, deliveryCount: 0, lastDeliveredAt: null, lastDeliveryTurn: null,
   };
@@ -58,6 +69,10 @@ export function queueTelemetryAlert(state, telemetry, now = Date.now(), { consec
     reason: telemetry.reason,
     consecutiveCount,
     halted,
+    attempt,
+    pausedUntil,
+    durationMinutes,
+    exhausted,
   });
   return alert;
 }
@@ -69,7 +84,12 @@ export function userNotice(alert) {
     const reasonText = alert.details?.reason ? `（${alert.details.reason}）` : '';
     const count = alert.details?.consecutiveCount || 1;
     if (alert.halted || count >= 2) {
-      return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发任务硬熔断（Task Halt），强制拦截所有后续工具执行！请切换代理节点或新开会话。`;
+      if (alert.details?.exhausted) {
+        return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。已耗尽全部指数退避重试（15m/30m/60m），预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发永久硬熔断（Task Halt），强制拦截所有后续工具执行！`;
+      }
+      const dur = alert.details?.durationMinutes || 15;
+      const att = alert.details?.attempt || 1;
+      return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发任务防护暂停（第 ${att}/3 次，暂停 ${dur} 分钟），强制拦截所有后续工具执行以保护代码质量！倒计时结束后将自动放行金丝雀验证。`;
     }
     return `ModelTrace Guard 警报：本地 SQLite 遥测发现服务端降级指令${reasonText}（连续第 ${count} 次）。预期模型为 ${JSON.stringify(alert.expected)}，降级分流至 ${JSON.stringify(alert.prediction)}${used}。已触发 fast-fail 阻断工具执行，请切换节点或调整配置。`;
   }

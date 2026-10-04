@@ -519,14 +519,149 @@ test('two consecutive telemetry degradations trigger taskHalt hard stop', async 
   assert.equal(state.taskHalt.retryCount, 2);
   assert.equal(state.taskHalt.actual, 'gpt-6-luna');
 
-  // 后续 PreToolUse 必须被硬中断 deny 拦截
+  assert.equal(state.taskHalt.attempt, 1);
+  assert.equal(state.taskHalt.durationMs, 15 * 60 * 1000);
+  assert.equal(state.taskHalt.pausedUntil, 1002 + 15 * 60 * 1000);
+
+  // 后续 PreToolUse 在冷却期内必须被拦截 (deny) 并带有倒计时提示
   const preToolResult = await handleHook({ session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-2', model: 'gpt-6.1-sol', tool_name: 'Bash', tool_input: { command: 'ls' } }, dataDir, 1004);
   assert.equal(preToolResult.hookSpecificOutput?.permissionDecision, 'deny');
   assert.ok(preToolResult.hookSpecificOutput?.permissionDecisionReason?.includes('STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER'));
+  assert.ok(preToolResult.hookSpecificOutput?.permissionDecisionReason?.includes('attempt 1/3'));
 
   // 验证用户 resume 命令能够解除 halt 并重置计数
   const resumeResult = await run(['resume', '--session', sessionId, '--data-dir', dataDir, '--halt', state.taskHalt.id]);
   assert.ok(resumeResult);
+  state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt, null);
+  assert.equal(state.consecutiveDegradedCount, 0);
+});
+
+test('exponential backoff canary verification: cooldown expiry permits tool and healthy response recovers session', async (t) => {
+  const dir = await tempDir(t);
+  const dbFile = path.join(dir, 'canary_logs.sqlite');
+  initTestDb(dbFile);
+  const dataDir = path.join(dir, 'data');
+  const sessionId = 'session-canary-recovery';
+  const originalDb = process.env.CODEX_LOGS_DB;
+  const originalBaseMs = process.env.MODELTRACE_BACKOFF_BASE_MS;
+  process.env.CODEX_LOGS_DB = dbFile;
+  process.env.MODELTRACE_BACKOFF_BASE_MS = '1000'; // 1s base for test
+  t.after(() => {
+    if (originalDb === undefined) delete process.env.CODEX_LOGS_DB;
+    else process.env.CODEX_LOGS_DB = originalDb;
+    if (originalBaseMs === undefined) delete process.env.MODELTRACE_BACKOFF_BASE_MS;
+    else process.env.MODELTRACE_BACKOFF_BASE_MS = originalBaseMs;
+  });
+
+  await handleHook({ session_id: sessionId, hook_event_name: 'SessionStart', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1000);
+
+  // 两次降级 -> 触发 attempt 1 (1s pause)
+  insertTestLog(dbFile, {
+    id: 201, ts: 1789640001, threadId: sessionId,
+    body: 'turn{thread.id=session-canary-recovery model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}',
+  });
+  await handleHook({ session_id: sessionId, hook_event_name: 'UserPromptSubmit', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1001);
+
+  insertTestLog(dbFile, {
+    id: 202, ts: 1789640002, threadId: sessionId,
+    body: 'turn{thread.id=session-canary-recovery model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}',
+  });
+  await handleHook({ session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1002);
+
+  let state = await readState(dataDir, sessionId);
+  assert.ok(state.taskHalt);
+  assert.equal(state.taskHalt.attempt, 1);
+  assert.equal(state.taskHalt.durationMs, 1000);
+  assert.equal(state.taskHalt.pausedUntil, 2002);
+
+  // 在 1002 ~ 2001 毫秒内，PreToolUse 必须被拦截 (deny)
+  const deniedPreTool = await handleHook({ session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-2', model: 'gpt-6.1-sol', tool_name: 'Bash', tool_input: { command: 'ls' } }, dataDir, 1500);
+  assert.equal(deniedPreTool.hookSpecificOutput?.permissionDecision, 'deny');
+
+  // 到达 2003 毫秒 (已过 pausedUntil)，PreToolUse 作为金丝雀必须被放行 (允许工具执行)
+  const canaryPreTool = await handleHook({ session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-2', model: 'gpt-6.1-sol', tool_name: 'Bash', tool_input: { command: 'ls' } }, dataDir, 2003);
+  assert.deepEqual(canaryPreTool, {});
+  state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt?.canaryActive, true);
+
+  // 随后该金丝雀轮次在 Stop 时发现新日志已恢复正常 (degraded = false)
+  insertTestLog(dbFile, {
+    id: 203, ts: 1789640003, threadId: sessionId,
+    body: 'turn{thread.id=session-canary-recovery model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"server": "cloudflare"}',
+  });
+  await handleHook({ session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-2', model: 'gpt-6.1-sol' }, dataDir, 2004);
+
+  // 会话完全自愈恢复！taskHalt 被清空，计数重置
+  state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt, null);
+  assert.equal(state.consecutiveDegradedCount, 0);
+});
+
+test('exponential backoff progression: 15m -> 30m -> 60m -> exhausted and force resume', async (t) => {
+  const dir = await tempDir(t);
+  const dbFile = path.join(dir, 'backoff_prog_logs.sqlite');
+  initTestDb(dbFile);
+  const dataDir = path.join(dir, 'data');
+  const sessionId = 'session-backoff-prog';
+  const originalDb = process.env.CODEX_LOGS_DB;
+  const originalBaseMs = process.env.MODELTRACE_BACKOFF_BASE_MS;
+  process.env.CODEX_LOGS_DB = dbFile;
+  process.env.MODELTRACE_BACKOFF_BASE_MS = '1000'; // 1s -> 2s -> 4s
+  t.after(() => {
+    if (originalDb === undefined) delete process.env.CODEX_LOGS_DB;
+    else process.env.CODEX_LOGS_DB = originalDb;
+    if (originalBaseMs === undefined) delete process.env.MODELTRACE_BACKOFF_BASE_MS;
+    else process.env.MODELTRACE_BACKOFF_BASE_MS = originalBaseMs;
+  });
+
+  await handleHook({ session_id: sessionId, hook_event_name: 'SessionStart', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1000);
+
+  // 连续 2 次降级 -> attempt 1 (1s)
+  insertTestLog(dbFile, { id: 301, ts: 1789640001, threadId: sessionId, body: 'turn{thread.id=session-backoff-prog model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}' });
+  await handleHook({ session_id: sessionId, hook_event_name: 'UserPromptSubmit', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1001);
+  insertTestLog(dbFile, { id: 302, ts: 1789640002, threadId: sessionId, body: 'turn{thread.id=session-backoff-prog model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}' });
+  await handleHook({ session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-1', model: 'gpt-6.1-sol' }, dataDir, 1002);
+
+  let state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt.attempt, 1);
+  assert.equal(state.taskHalt.durationMs, 1000);
+  assert.equal(state.taskHalt.pausedUntil, 2002);
+
+  // 第 1 次金丝雀失败：在 2003 毫秒金丝雀放行后，Stop 依然收到降级响应 -> 升级为 attempt 2 (2s)
+  insertTestLog(dbFile, { id: 303, ts: 1789640003, threadId: sessionId, body: 'turn{thread.id=session-backoff-prog model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}' });
+  await handleHook({ session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-2', model: 'gpt-6.1-sol' }, dataDir, 2005);
+
+  state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt.attempt, 2);
+  assert.equal(state.taskHalt.durationMs, 2000);
+  assert.equal(state.taskHalt.pausedUntil, 4005);
+
+  // 第 2 次金丝雀失败：在 4006 毫秒放行后，Stop 依然降级 -> 升级为 attempt 3 (4s)
+  insertTestLog(dbFile, { id: 304, ts: 1789640004, threadId: sessionId, body: 'turn{thread.id=session-backoff-prog model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}' });
+  await handleHook({ session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-3', model: 'gpt-6.1-sol' }, dataDir, 4010);
+
+  state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt.attempt, 3);
+  assert.equal(state.taskHalt.durationMs, 4000);
+  assert.equal(state.taskHalt.pausedUntil, 8010);
+
+  // 第 3 次金丝雀失败：在 8011 毫秒放行后，Stop 依然降级 -> 达到 maxAttempts (3) -> 触发 exhausted 永久停机！
+  insertTestLog(dbFile, { id: 305, ts: 1789640005, threadId: sessionId, body: 'turn{thread.id=session-backoff-prog model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}' });
+  await handleHook({ session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-4', model: 'gpt-6.1-sol' }, dataDir, 8015);
+
+  state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt.exhausted, true);
+  assert.equal(state.taskHalt.pausedUntil, null);
+
+  // 永久停机状态下，即使经过很长时间，PreToolUse 依然永久 deny
+  const exhaustedPreTool = await handleHook({ session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-5', model: 'gpt-6.1-sol', tool_name: 'Bash', tool_input: { command: 'ls' } }, dataDir, 999999);
+  assert.equal(exhaustedPreTool.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.ok(exhaustedPreTool.hookSpecificOutput?.permissionDecisionReason?.includes('backoff attempts exhausted'));
+
+  // 验证用户使用 --force 能够强制解除锁定并重置状态
+  const forceResume = await run(['resume', '--session', sessionId, '--data-dir', dataDir, '--force', 'true']);
+  assert.ok(forceResume);
   state = await readState(dataDir, sessionId);
   assert.equal(state.taskHalt, null);
   assert.equal(state.consecutiveDegradedCount, 0);
