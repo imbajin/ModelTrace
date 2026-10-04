@@ -89,7 +89,7 @@ export function userNotice(alert) {
       }
       const dur = alert.details?.durationMinutes || 15;
       const att = alert.details?.attempt || 1;
-      return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发任务防护暂停（第 ${att}/3 次，暂停 ${dur} 分钟），强制拦截所有后续工具执行以保护代码质量！倒计时结束后将自动放行金丝雀验证。`;
+      return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发任务防护暂停（第 ${att}/3 次，暂停 ${dur} 分钟），强制拦截所有后续工具执行以保护代码质量！倒计时结束后将自动放行单次工具调用进行试探验证。`;
     }
     return `ModelTrace Guard 警报：本地 SQLite 遥测发现服务端降级指令${reasonText}（连续第 ${count} 次）。预期模型为 ${JSON.stringify(alert.expected)}，降级分流至 ${JSON.stringify(alert.prediction)}${used}。已触发 fast-fail 阻断工具执行，请切换节点或调整配置。`;
   }
