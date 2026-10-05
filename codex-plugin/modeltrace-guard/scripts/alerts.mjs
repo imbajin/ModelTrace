@@ -85,11 +85,11 @@ export function userNotice(alert) {
     const count = alert.details?.consecutiveCount || 1;
     if (alert.halted || count >= 2) {
       if (alert.details?.exhausted) {
-        return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。已耗尽全部指数退避重试（15m/30m/60m），预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发永久硬熔断（Task Halt），强制拦截所有后续工具执行！`;
+        return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。已耗尽全部指数退避重试（15m/30m/60m），预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发永久硬熔断（Task Halt）！此会话已被服务端锁定降级，直接 Fork 亦会继承降级状态。请停止当前会话，新建会话（New Chat）并结合会话链接进行 Handoff 接续任务！`;
       }
       const dur = alert.details?.durationMinutes || 15;
       const att = alert.details?.attempt || 1;
-      return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发任务防护暂停（第 ${att}/3 次，暂停 ${dur} 分钟），强制拦截所有后续工具执行以保护代码质量！倒计时结束后将自动放行单次工具调用进行试探验证。`;
+      return `ModelTrace Guard 严重警报：本地 SQLite 遥测连续 ${count} 次检测到服务端降级指令${reasonText}。预期模型为 ${JSON.stringify(alert.expected)}，实际分流至 ${JSON.stringify(alert.prediction)}${used}。已触发任务防护暂停（第 ${att}/3 次，暂停 ${dur} 分钟），强制拦截所有后续工具执行以保护代码质量！\n【关键建议】此会话因长上下文或服务端状态已被锁定降级，直接 Fork 亦会继承该状态！建议：停止本任务，复制当前会话链接（Copy Thread Link）并在【新开会话】中接续任务，即可立刻恢复满血状态（倒计时结束后亦将尝试单次试探验证）。`;
     }
     return `ModelTrace Guard 警报：本地 SQLite 遥测发现服务端降级指令${reasonText}（连续第 ${count} 次）。预期模型为 ${JSON.stringify(alert.expected)}，降级分流至 ${JSON.stringify(alert.prediction)}${used}。已触发 fast-fail 阻断工具执行，请切换节点或调整配置。`;
   }
