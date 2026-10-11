@@ -30,6 +30,7 @@ export async function codexExecutable(env = process.env) {
 export class AppServerClient {
   constructor(child, protocolOptions = {}) {
     this.child = child; this.nextId = 0; this.pending = new Map(); this.listeners = new Set(); this.closed = false; this.allowedTurns = new Set(); this.failure = null;
+    this.enforceAllowedTurns = protocolOptions.enforceAllowedTurns ?? true;
     const rejectPending = (error) => {
       for (const waiting of this.pending.values()) { clearTimeout(waiting.timer); waiting.reject(error); }
       this.pending.clear();
@@ -60,7 +61,7 @@ export class AppServerClient {
         }
         else waiting.resolve(message.result);
       } else if (message.method) {
-        if (message.method === 'turn/started') {
+        if (message.method === 'turn/started' && this.enforceAllowedTurns) {
           // One explicit request permits one turn, not automatic continuation.
           if (!this.allowedTurns.delete(message.params?.threadId)) {
             const error = new Error('Codex probe attempted an unrequested turn; no sample accepted');
@@ -104,16 +105,69 @@ export class AppServerClient {
   }
 }
 
-export async function openAppServer(env = process.env) {
+export async function openAppServer(env = process.env, protocolOptions = {}) {
   const executable = await codexExecutable(env);
   const child = spawn(executable, ['app-server', '--stdio'], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...env, MODELTRACE_PROBE_PROCESS: '1' },
   });
-  const client = new AppServerClient(child);
+  const client = new AppServerClient(child, protocolOptions);
   try {
     await client.request('initialize', { clientInfo: CODEX_CLIENT_INFO, capabilities: { experimentalApi: true } });
     client.write({ method: 'initialized' });
     return client;
   } catch (error) { await client.close(); throw error; }
 }
+
+const CODEX_UUID_REGEX = /^(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function pauseThreadGoal(session, env = process.env, dependencies = {}) {
+  const isCustomConnect = Boolean(dependencies.client || dependencies.connect);
+  if (!isCustomConnect && !CODEX_UUID_REGEX.test(session)) {
+    return { hasGoal: false, paused: true, previousStatus: null, goal: null };
+  }
+  const timeout = dependencies.timeoutMs || 4000;
+  const connect = dependencies.connect || ((e) => openAppServer(e, { enforceAllowedTurns: false }));
+  const client = dependencies.client || await connect(env);
+  try {
+    const getRes = await client.request('thread/goal/get', { threadId: session }, timeout);
+    const currentGoal = getRes?.goal;
+    if (!currentGoal || currentGoal.status === 'paused' || currentGoal.status === 'complete' || currentGoal.status === 'abandoned') {
+      return { hasGoal: Boolean(currentGoal), paused: true, previousStatus: currentGoal?.status || null, goal: currentGoal || null };
+    }
+    const setRes = await client.request('thread/goal/set', { threadId: session, status: 'paused' }, timeout);
+    if (setRes?.goal?.status !== 'paused') {
+      throw new Error(`Host goal pause unconfirmed: status is ${setRes?.goal?.status || 'unknown'}`);
+    }
+    return { hasGoal: true, paused: true, previousStatus: currentGoal.status, goal: setRes.goal };
+  } finally {
+    if (!dependencies.client) await client.close();
+  }
+}
+
+export async function resumeThreadGoal(session, env = process.env, dependencies = {}) {
+  const isCustomConnect = Boolean(dependencies.client || dependencies.connect);
+  if (!isCustomConnect && !CODEX_UUID_REGEX.test(session)) {
+    return { hasGoal: false, resumed: false, goal: null };
+  }
+  const timeout = dependencies.timeoutMs || 4000;
+  const connect = dependencies.connect || ((e) => openAppServer(e, { enforceAllowedTurns: false }));
+  const client = dependencies.client || await connect(env);
+  try {
+    const getRes = await client.request('thread/goal/get', { threadId: session }, timeout);
+    const currentGoal = getRes?.goal;
+    if (!currentGoal) return { hasGoal: false, resumed: false, goal: null };
+    if (currentGoal.status === 'active') return { hasGoal: true, resumed: true, goal: currentGoal };
+    if (currentGoal.status === 'complete' || currentGoal.status === 'abandoned') {
+      return { hasGoal: true, resumed: false, goal: currentGoal, reason: `Goal is already ${currentGoal.status}` };
+    }
+    const setRes = await client.request('thread/goal/set', { threadId: session, status: 'active' }, timeout);
+    if (setRes?.goal?.status !== 'active') {
+      throw new Error(`Host goal resume unconfirmed: status is ${setRes?.goal?.status || 'unknown'}`);
+    }
+    return { hasGoal: true, resumed: true, goal: setRes.goal };
+  } finally {
+    if (!dependencies.client) await client.close();
+  }
+}
+

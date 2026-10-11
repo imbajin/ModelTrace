@@ -9,6 +9,7 @@ import { checkSqliteLatest } from './sqlite-checker.mjs';
 import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
 export { summarize } from './status.mjs';
+import { pauseThreadGoal, resumeThreadGoal } from './app-server-client.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, getEnvConfig, issue,
   readState, recentComparable, record, schedule, segment, setTaskName, setTurn, validateConfig, validateNumbers, withState, workspaceName,
@@ -53,10 +54,15 @@ export function getBackoffDurationMs(attempt, env = process.env) {
 
 export function controlContext(state, directory, now = Date.now()) {
   if (state.taskHalt) {
+    const hostNote = state.taskHalt.hostError
+      ? ` CRITICAL HOST GOAL WARNING: Automatic goal pause failed (${state.taskHalt.hostError}). The active goal may continue scheduling turns unless manually stopped or paused by user.`
+      : state.taskHalt.goalPaused
+        ? ' Host active goal has been safely paused.'
+        : '';
     if (state.taskHalt.source === 'telemetry') {
       const halt = state.taskHalt;
       if (halt.exhausted) {
-        return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. Local SQLite telemetry detected persistent server downgrade (${halt.attempt || 3}/${halt.maxAttempts || 3} backoff attempts exhausted, reason: ${halt.reason || 'Safety Buffering'}). Stop edits, commands, delegation and other task work. Explain to the user: this session is pinned to degraded routing by the gateway (and directly forking this thread will inherit the bloated history and downgrade flag). Strongly advise the user to copy this thread link (Copy Thread Link) or summarize handoff notes, and start a NEW CLEAN SESSION (New Chat) to immediately restore the full-power model. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. Halt ID: ${JSON.stringify(halt.id)}.`;
+        return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. Local SQLite telemetry detected persistent server downgrade (${halt.attempt || 3}/${halt.maxAttempts || 3} backoff attempts exhausted, reason: ${halt.reason || 'Safety Buffering'}).${hostNote} Stop edits, commands, delegation and other task work. Explain to the user: this session is pinned to degraded routing by the gateway (and directly forking this thread will inherit the bloated history and downgrade flag). Strongly advise the user to copy this thread link (Copy Thread Link) or summarize handoff notes, and start a NEW CLEAN SESSION (New Chat) to immediately restore the full-power model. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. Halt ID: ${JSON.stringify(halt.id)}.`;
       }
       if (halt.pausedUntil && now < halt.pausedUntil) {
         const remainingSeconds = Math.max(1, Math.ceil((halt.pausedUntil - now) / 1000));
@@ -64,11 +70,11 @@ export function controlContext(state, directory, now = Date.now()) {
         const remSec = remainingSeconds % 60;
         const timeStr = remainingMinutes > 0 ? `${remainingMinutes}m ${remSec}s` : `${remainingSeconds}s`;
         const durMin = Math.round((halt.durationMs || 15 * 60 * 1000) / 60000);
-        return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. Local SQLite telemetry detected server downgrade to ${JSON.stringify(halt.actual || 'fallback model')} (${halt.retryCount || 2} consecutive checks, reason: ${halt.reason || 'Safety Buffering'}). Paused for ${durMin}m (attempt ${halt.attempt || 1}/${halt.maxAttempts || 3}). Remaining cooldown: ${timeStr}. Stop edits, commands, delegation and other task work. CRITICAL NOTE: This session is likely pinned to degraded routing due to heavy context or server turn-state; directly forking this thread will also inherit the downgrade. Advise the user to copy this thread link (Copy Thread Link) or write handoff notes, and start a NEW CLEAN SESSION (New Chat) to resume full-power model immediately. When cooldown ends, a trial tool request will test if the server has recovered. To resume in this session anyway without waiting, run: node ${quote(path.join(ROOT, 'scripts', 'guard.mjs'))} resume --session ${quote(state.session)} --data-dir ${quote(directory)} --halt ${quote(halt.id)}`;
+        return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. Local SQLite telemetry detected server downgrade to ${JSON.stringify(halt.actual || 'fallback model')} (${halt.retryCount || 2} consecutive checks, reason: ${halt.reason || 'Safety Buffering'}). Paused for ${durMin}m (attempt ${halt.attempt || 1}/${halt.maxAttempts || 3}). Remaining cooldown: ${timeStr}.${hostNote} Stop edits, commands, delegation and other task work. CRITICAL NOTE: This session is likely pinned to degraded routing due to heavy context or server turn-state; directly forking this thread will also inherit the downgrade. Advise the user to copy this thread link (Copy Thread Link) or write handoff notes, and start a NEW CLEAN SESSION (New Chat) to resume full-power model immediately. When cooldown ends, a trial tool request will test if the server has recovered. To resume in this session anyway without waiting, run: node ${quote(path.join(ROOT, 'scripts', 'guard.mjs'))} resume --session ${quote(state.session)} --data-dir ${quote(directory)} --halt ${quote(halt.id)}`;
       }
-      return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. Local SQLite telemetry detected that the server continuously downgraded/diverted the model to ${JSON.stringify(state.taskHalt.actual || 'fallback model')} (${state.taskHalt.retryCount} consecutive checks, reason: ${state.taskHalt.reason || 'Safety Buffering'}). Stop edits, commands, delegation and other task work. Explain to the user that this session is pinned to degraded routing (and directly forking will also inherit it). Advise the user to copy this thread link (Copy Thread Link) and start a NEW CLEAN SESSION (New Chat) to resume full-power model immediately. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
+      return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. Local SQLite telemetry detected that the server continuously downgraded/diverted the model to ${JSON.stringify(state.taskHalt.actual || 'fallback model')} (${state.taskHalt.retryCount} consecutive checks, reason: ${state.taskHalt.reason || 'Safety Buffering'}).${hostNote} Stop edits, commands, delegation and other task work. Explain to the user that this session is pinned to degraded routing (and directly forking will also inherit it). Advise the user to copy this thread link (Copy Thread Link) and start a NEW CLEAN SESSION (New Chat) to resume full-power model immediately. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
     }
-    return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. All ${state.taskHalt.retryCount} follow-up probes disagreed with the expected model ${JSON.stringify(state.taskHalt.expected)}. Stop edits, commands, delegation and other task work. Explain the initial alert and retry results in a final user-visible answer, then wait for the user's decision. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. This is a fingerprint comparison, not proof of backend identity. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
+    return `ModelTrace Guard: STOP THE ORIGINAL TASK NOW AND NOTIFY THE USER. All ${state.taskHalt.retryCount} follow-up probes disagreed with the expected model ${JSON.stringify(state.taskHalt.expected)}.${hostNote} Stop edits, commands, delegation and other task work. Explain the initial alert and retry results in a final user-visible answer, then wait for the user's decision. Do not resume automatically, clear the halt, or treat acknowledging the alert as permission to continue. This is a fingerprint comparison, not proof of backend identity. Halt ID: ${JSON.stringify(state.taskHalt.id)}.`;
   }
   const batch = state.confirmation;
   if (batch?.status === 'active') {
@@ -97,7 +103,7 @@ function ownCommand(event) {
 
 // No substring exemption: `echo "guard.mjs status"; dangerous-command` must not
 // bypass a halt. The only escape is one direct invocation of this exact runner.
-export function isControlCommand(event) {
+export function isControlCommand(event, isHalted = false) {
   if (!['Bash', 'exec_command', 'shell_command'].includes(event.tool_name)) return false;
   const input = event.tool_input;
   const command = typeof input === 'string' ? input : input?.cmd || input?.command || '';
@@ -106,7 +112,10 @@ export function isControlCommand(event) {
   const tokens = words.map((word) => word.replace(/^(['"])(.*)\1$/, '$2'));
   if (tokens.length < 3 || !/^(?:node(?:\.exe)?|.*[\\/]node(?:\.exe)?)$/i.test(tokens[0])) return false;
   if (path.resolve(tokens[1]) !== path.join(ROOT, 'scripts', 'guard.mjs')) return false;
-  if (!['status', 'stop', 'resume', 'acknowledge', 'wait', 'probe', 'doctor', 'dashboard', 'dashboard-stop', 'check-sqlite'].includes(tokens[2])) return false;
+  const allowed = isHalted
+    ? ['status', 'stop', 'resume', 'acknowledge', 'check-sqlite']
+    : ['status', 'stop', 'resume', 'acknowledge', 'wait', 'probe', 'doctor', 'dashboard', 'dashboard-stop', 'check-sqlite'];
+  if (!allowed.includes(tokens[2])) return false;
   try { parseArguments(tokens.slice(2)); return true; } catch { return false; }
 }
 
@@ -114,8 +123,9 @@ function preToolDecision(event, state, directory, now = Date.now()) {
   if (state?.taskHalt?.source === 'telemetry' && state.taskHalt.pausedUntil && now >= state.taskHalt.pausedUntil && !state.taskHalt.exhausted) {
     return {};
   }
+  const isHalted = Boolean(state?.taskHalt);
   const reason = state ? notificationContext(state, directory, undefined, now) || controlContext(state, directory, now) : null;
-  if (reason && !isControlCommand(event)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  if (reason && !isControlCommand(event, isHalted)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
   return {};
 }
 
@@ -131,6 +141,7 @@ async function busyHookFallback(event, directory, error) {
   // State commits use atomic rename, so readers can enforce the last committed
   // policy without taking or stealing the busy writer's lease. Do not change
   // counts, acknowledge alerts or clear a halt on this read-only path.
+  const isHalted = Boolean(state?.taskHalt);
   if (event.hook_event_name === 'PreToolUse') return preToolDecision(event, state, directory, Date.now());
   if (!state) return {};
   const waiting = pendingAlerts(state), control = controlContext(state, directory, Date.now());
@@ -138,17 +149,18 @@ async function busyHookFallback(event, directory, error) {
   const notice = [waiting.map(userNotice).join('\n'), control].filter(Boolean).join('\n');
   if (!notice) return {};
   const continueOnce = !event.stop_hook_active && state.stopTurn !== (state.turn || 'no-turn')
-    && (waiting.length || state.confirmation?.status === 'active');
+    && (waiting.length || state.confirmation?.status === 'active') && !isHalted;
   return { systemMessage: notice, ...(continueOnce ? { decision: 'block', reason: notificationContext(state, directory) || control } : {}) };
 }
 
-export async function handleHook(event, directory, now = Date.now(), draw = randomInt, { background = false } = {}) {
+export async function handleHook(event, directory, now = Date.now(), draw = randomInt, { background = false, dependencies = {} } = {}) {
   if (!event || typeof event.session_id !== 'string' || !event.session_id || event.session_id.length > 256) throw new Error('Missing or invalid session_id in hook input');
   // No subagent samples may be submitted as root-task evidence.
   if (event.agent_id || event.parent_session_id) return {};
   const supported = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'Stop', 'Interrupt', 'SessionEnd'];
   if (!supported.includes(event.hook_event_name)) return {};
-  return withState(directory, event.session_id, async (state) => {
+  let haltNeedsPause = false, haltId = null;
+  const hookOutput = await withState(directory, event.session_id, async (state) => {
     const hook = event.hook_event_name;
     state.lastHookAt = now;
     if (background) state.lastBackgroundHookAt = now;
@@ -203,31 +215,9 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
             reason: telemetry.reason,
           };
           if (telemetry.degraded) {
-            state.consecutiveDegradedCount = (state.consecutiveDegradedCount || 0) + 1;
-            const threshold = Number(process.env.MODELTRACE_TELEMETRY_HALT_COUNT || 2);
-            const shouldHalt = state.consecutiveDegradedCount >= threshold;
-            const maxAttempts = Number(process.env.MODELTRACE_BACKOFF_MAX_ATTEMPTS || 3);
-            if (shouldHalt) {
-              if (!state.taskHalt) {
-                const durationMs = getBackoffDurationMs(1);
-                state.taskHalt = {
-                  id: `telemetry-halt-${telemetry.record.logId || now}`,
-                  at: now,
-                  source: 'telemetry',
-                  expected: state.expected || state.model || telemetry.record.requestedModel,
-                  actual: telemetry.record.fasterModel || 'unknown_faster_model',
-                  retryCount: state.consecutiveDegradedCount,
-                  reason: telemetry.reason,
-                  alertId: `telemetry-${telemetry.record.logId || now}`,
-                  attempt: 1,
-                  maxAttempts,
-                  durationMs,
-                  pausedUntil: now + durationMs,
-                  canaryActive: false,
-                  exhausted: false,
-                };
-                record(state, 'task_halt_requested', now, { ...state.taskHalt });
-              } else if (state.taskHalt.source === 'telemetry') {
+            if (state.taskHalt) {
+              if (state.taskHalt.source === 'telemetry' && !state.taskHalt.exhausted) {
+                const maxAttempts = Number(process.env.MODELTRACE_BACKOFF_MAX_ATTEMPTS || 3);
                 if (state.taskHalt.attempt < (state.taskHalt.maxAttempts || maxAttempts)) {
                   const nextAttempt = (state.taskHalt.attempt || 1) + 1;
                   const durationMs = getBackoffDurationMs(nextAttempt);
@@ -246,17 +236,42 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
                   record(state, 'task_halt_exhausted', now, { ...state.taskHalt });
                 }
               }
+            } else {
+              state.consecutiveDegradedCount = (state.consecutiveDegradedCount || 0) + 1;
+              const threshold = Number(process.env.MODELTRACE_TELEMETRY_HALT_COUNT || 2);
+              const shouldHalt = state.consecutiveDegradedCount >= threshold;
+              const maxAttempts = Number(process.env.MODELTRACE_BACKOFF_MAX_ATTEMPTS || 3);
+              if (shouldHalt) {
+                const durationMs = getBackoffDurationMs(1);
+                state.taskHalt = {
+                  id: `telemetry-halt-${telemetry.record.logId || now}`,
+                  at: now,
+                  source: 'telemetry',
+                  expected: state.expected || state.model || telemetry.record.requestedModel,
+                  actual: telemetry.record.fasterModel || 'unknown_faster_model',
+                  retryCount: state.consecutiveDegradedCount,
+                  reason: telemetry.reason,
+                  alertId: `telemetry-${telemetry.record.logId || now}`,
+                  attempt: 1,
+                  maxAttempts,
+                  durationMs,
+                  pausedUntil: now + durationMs,
+                  canaryActive: false,
+                  exhausted: false,
+                };
+                record(state, 'task_halt_requested', now, { ...state.taskHalt });
+              }
+              queueTelemetryAlert(state, telemetry.record, now, {
+                consecutiveCount: state.consecutiveDegradedCount,
+                halted: Boolean(state.taskHalt),
+                attempt: state.taskHalt?.attempt || 1,
+                pausedUntil: state.taskHalt?.pausedUntil || null,
+                durationMinutes: Math.round((state.taskHalt?.durationMs || 15 * 60 * 1000) / 60000),
+                exhausted: Boolean(state.taskHalt?.exhausted),
+              });
             }
-            queueTelemetryAlert(state, telemetry.record, now, {
-              consecutiveCount: state.consecutiveDegradedCount,
-              halted: Boolean(state.taskHalt),
-              attempt: state.taskHalt?.attempt || 1,
-              pausedUntil: state.taskHalt?.pausedUntil || null,
-              durationMinutes: Math.round((state.taskHalt?.durationMs || 15 * 60 * 1000) / 60000),
-              exhausted: Boolean(state.taskHalt?.exhausted),
-            });
           } else {
-            if (state.taskHalt?.source === 'telemetry') {
+            if (state.taskHalt?.source === 'telemetry' && !state.taskHalt.exhausted && state.taskHalt.canaryActive) {
               record(state, 'telemetry_recovered', now, {
                 logId: telemetry.record.logId,
                 previousCount: state.consecutiveDegradedCount,
@@ -264,7 +279,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
               });
               state.taskHalt = null;
               state.consecutiveDegradedCount = 0;
-            } else if (state.consecutiveDegradedCount > 0) {
+            } else if (!state.taskHalt && state.consecutiveDegradedCount > 0) {
               record(state, 'telemetry_recovered', now, {
                 logId: telemetry.record.logId,
                 previousCount: state.consecutiveDegradedCount,
@@ -282,13 +297,23 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
         state.taskHalt.canaryActive = true;
         return {};
       }
+      if (state.taskHalt && !state.taskHalt.goalPaused && !state.taskHalt.hostConfirmed) {
+        haltNeedsPause = true;
+        haltId = state.taskHalt.id;
+      }
       return preToolDecision(event, state, directory, now);
     }
     const deliver = (output, force = false) => {
+      if (state.taskHalt && !state.taskHalt.goalPaused && !state.taskHalt.hostConfirmed) {
+        haltNeedsPause = true;
+        haltId = state.taskHalt.id;
+      }
       if (!['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop'].includes(hook)) return output;
       if (state.taskHalt) {
         const context = controlContext(state, directory, now);
-        output = hook === 'Stop' ? { ...output, systemMessage: context } : { ...output, ...injected(hook, context), systemMessage: context };
+        output = hook === 'Stop'
+          ? { continue: false, ...output, systemMessage: context }
+          : { ...output, ...injected(hook, context), systemMessage: context };
       }
       const batch = waiting.filter((alert) => force || alert.lastDeliveryTurn !== turnKey).slice(0, 5);
       if (!batch.length) return output;
@@ -297,7 +322,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       }
       const context = notificationContext(state, directory, batch, now);
       const notice = batch.map(userNotice).join('\n');
-      if (hook === 'Stop') return { ...output, systemMessage: notice, ...(output.decision === 'block' ? { reason: context + '\n' + (output.reason || '') } : {}) };
+      if (hook === 'Stop') return { ...output, systemMessage: [output.systemMessage, notice].filter(Boolean).join('\n'), ...(output.decision === 'block' ? { reason: context + '\n' + (output.reason || '') } : {}) };
       return { ...output, ...injected(hook, context + (output.hookSpecificOutput?.additionalContext ? '\n' + output.hookSpecificOutput.additionalContext : '')), systemMessage: [output.systemMessage, notice].filter(Boolean).join('\n') };
     };
     // Old lifecycle events cannot reset the current runtime, but a persistent
@@ -359,6 +384,14 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       if (event.stop_hook_active || state.stopTurn === (state.turn || 'no-turn')) {
         return deliver({}, true);
       }
+      if (state.taskHalt) {
+        state.stopTurn = state.turn || 'no-turn';
+        if (!state.taskHalt.haltStopDelivered) {
+          state.taskHalt.haltStopDelivered = true;
+          return deliver({ continue: false, decision: 'block', reason: controlContext(state, directory) || notificationContext(state, directory) }, true);
+        }
+        return deliver({ continue: false, systemMessage: controlContext(state, directory, now) }, true);
+      }
       // Normal probes never delay the final answer or lose ownership at Stop.
       // Only an actionable alert/confirmation warrants a bounded continuation.
       if (waiting.length || state.confirmation?.status === 'active') {
@@ -371,6 +404,54 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     issue(state, now, draw);
     return deliver({}, hook === 'SessionStart');
   }, background ? BACKGROUND_STATE_LOCK : undefined).catch((error) => busyHookFallback(event, directory, error));
+  if (haltNeedsPause && haltId) {
+    try {
+      const pauseRes = await pauseThreadGoal(event.session_id, process.env, dependencies);
+      await withState(directory, event.session_id, (state) => {
+        if (state.taskHalt && state.taskHalt.id === haltId) {
+          state.taskHalt.goalPaused = Boolean(pauseRes.paused);
+          state.taskHalt.hasGoal = Boolean(pauseRes.hasGoal);
+          state.taskHalt.previousGoalStatus = pauseRes.previousStatus;
+          state.taskHalt.hostConfirmed = true;
+          state.taskHalt.hostError = null;
+          record(state, 'host_goal_paused', Date.now(), { halt: state.taskHalt.id, session: state.session, hasGoal: pauseRes.hasGoal });
+        }
+      }).catch(() => {});
+      const hostNote = pauseRes.hasGoal ? ' (host active goal paused)' : ' (no active host goal)';
+      if (hookOutput && typeof hookOutput === 'object') {
+        for (const key of ['reason', 'systemMessage']) {
+          if (hookOutput[key] && !hookOutput[key].includes('host active goal') && !hookOutput[key].includes('no active host goal')) {
+            hookOutput[key] = hookOutput[key].replace(/(\. Stop edits)/, `${hostNote}$1`);
+          }
+        }
+        if (hookOutput.hookSpecificOutput?.permissionDecisionReason && !hookOutput.hookSpecificOutput.permissionDecisionReason.includes('host active goal') && !hookOutput.hookSpecificOutput.permissionDecisionReason.includes('no active host goal')) {
+          hookOutput.hookSpecificOutput.permissionDecisionReason = hookOutput.hookSpecificOutput.permissionDecisionReason.replace(/(\. Stop edits)/, `${hostNote}$1`);
+        }
+      }
+    } catch (error) {
+      await withState(directory, event.session_id, (state) => {
+        if (state.taskHalt && state.taskHalt.id === haltId) {
+          state.taskHalt.goalPaused = false;
+          state.taskHalt.hostConfirmed = false;
+          state.taskHalt.hostError = error.message;
+          record(state, 'host_goal_pause_failed', Date.now(), { halt: state.taskHalt.id, session: state.session, error: error.message });
+        }
+      }).catch(() => {});
+      const hostWarning = ` CRITICAL HOST GOAL WARNING: Automatic goal pause failed (${error.message}). The active goal may continue scheduling turns unless manually stopped or paused by user.`;
+      if (hookOutput && typeof hookOutput === 'object') {
+        if (hookOutput.reason) hookOutput.reason += hostWarning;
+        if (hookOutput.hookSpecificOutput?.permissionDecisionReason) {
+          hookOutput.hookSpecificOutput.permissionDecisionReason += hostWarning;
+        }
+        if (hookOutput.systemMessage) {
+          hookOutput.systemMessage += hostWarning;
+        } else if (event.hook_event_name !== 'PreToolUse' || hookOutput.hookSpecificOutput?.permissionDecision === 'deny') {
+          hookOutput.systemMessage = `ModelTrace Guard:${hostWarning}`;
+        }
+      }
+    }
+  }
+  return hookOutput;
 }
 
 function parseArguments(args) {
@@ -441,7 +522,7 @@ export async function run(args, env = process.env, receipt = null) {
       const { handleBackgroundHook } = await import('./background.mjs');
       return handleBackgroundHook(event, directory, env);
     }
-    return handleHook(event, directory);
+    return handleHook(event, directory, undefined, undefined, { dependencies: receipt?.dependencies });
   }
   if (command === 'dashboard' || command === 'dashboard-stop') {
     const { launchDashboard, stopDashboard } = await import('./dashboard.mjs');
@@ -528,17 +609,37 @@ export async function run(args, env = process.env, receipt = null) {
   const patch = {};
   for (const key of fields) if (options[key] !== undefined) patch[key.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = key === 'mode' ? options[key] : key === 'languages' ? options[key].split(',').map((code) => code.trim().toLowerCase()) : Number(options[key]);
   if (command === 'start' || command === 'configure') await loadArtifacts();
-  return withState(directory, session, async (state) => {
-    if (command === 'resume') {
+  if (command === 'resume') {
+    const isForced = options.force === 'true' || options.force === '1' || options.force === true;
+    const currentState = await readState(directory, session);
+    if (!currentState?.taskHalt) throw new Error('Task is not halted');
+    if (!isForced && options.halt !== currentState.taskHalt.id) throw new Error('Explicit user-approved resume requires the current halt ID');
+    const wasGoalPaused = Boolean(currentState.taskHalt.goalPaused);
+    if (wasGoalPaused) {
+      try {
+        await resumeThreadGoal(session, env, receipt?.dependencies || {});
+      } catch (error) {
+        await withState(directory, session, (s) => {
+          if (s.taskHalt) {
+            s.taskHalt.hostError = `Resume failed: ${error.message}`;
+            s.taskHalt.hostConfirmed = false;
+          }
+          record(s, 'host_goal_resume_failed', Date.now(), { session, error: error.message });
+        }).catch(() => {});
+        throw new Error(`Host goal resume failed: ${error.message}. Task halt has been retained; retry with resume --halt ${currentState.taskHalt.id}`);
+      }
+    }
+    return withState(directory, session, (state) => {
       if (!state.taskHalt) throw new Error('Task is not halted');
-      const isForced = options.force === 'true' || options.force === '1' || options.force === true;
       if (!isForced && options.halt !== state.taskHalt.id) throw new Error('Explicit user-approved resume requires the current halt ID');
       record(state, 'task_resumed', now, { halt: state.taskHalt.id, forced: isForced });
       state.taskHalt = null;
       state.consecutiveDegradedCount = 0;
       schedule(state, now);
       return summarize(state, directory, now);
-    }
+    });
+  }
+  const commandResult = await withState(directory, session, async (state) => {
     if (command === 'stop') {
       abandon(state, now, 'monitoring_stopped');
       interruptConfirmation(state, now, 'monitoring_stopped');
@@ -586,6 +687,7 @@ export async function run(args, env = process.env, receipt = null) {
     const p = command === 'start' ? issue(state, now) : null;
     return { ...summarize(state, directory, now), challengeContext: p || (command === 'start' && state.pending) ? challengeContext(state, directory) : null, controlContext: controlContext(state, directory), agentAction: state.taskHalt ? 'stop_and_notify_user' : null };
   });
+  return commandResult;
 }
 
 export async function main(args = process.argv.slice(2)) {

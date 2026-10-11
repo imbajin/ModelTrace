@@ -24,7 +24,8 @@ export const pendingAlerts = (state) => (state?.alerts || []).filter((alert) => 
 export function queueTelemetryAlert(state, telemetry, now = Date.now(), { consecutiveCount = 1, halted = false, attempt = 1, pausedUntil = null, durationMinutes = 15, exhausted = false } = {}) {
   state.alerts ||= [];
   const id = `telemetry-${telemetry.logId || now}`;
-  const existing = state.alerts.find((alert) => alert.id === id);
+  const existing = state.alerts.find((alert) => alert.id === id)
+    || (halted ? state.alerts.find((alert) => alert.level === 'telemetry_downgrade' && alert.halted && !alert.acknowledgedAt) : null);
   if (existing) {
     if (halted) {
       existing.halted = true;
