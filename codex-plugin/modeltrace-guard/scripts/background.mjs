@@ -46,10 +46,18 @@ async function backgroundNotice(event, directory, session, confirmationId) {
 // fork here keeps its pipe and lifecycle owned by Codex's background hook,
 // never the foreground agent's tool call. No detached inference daemon or API.
 export async function handleBackgroundHook(event, directory, env = process.env, dependencies = {}) {
-  if (event.agent_id || event.parent_session_id || env.MODELTRACE_PROBE_PROCESS === '1'
-    || (env.CODEX_THREAD_ID && event.session_id !== env.CODEX_THREAD_ID)
-    || !BACKGROUND_EVENTS.includes(event.hook_event_name)) return {};
-  const output = await handleHook(event, directory, undefined, undefined, { background: true });
+  if (env.MODELTRACE_PROBE_PROCESS === '1' || !BACKGROUND_EVENTS.includes(event.hook_event_name)) return {};
+
+  const isSubagent = Boolean(event.agent_id || event.parent_session_id);
+  const parentSession = event.parent_session_id || (isSubagent ? env.CODEX_THREAD_ID : null);
+  const targetSession = isSubagent ? parentSession : event.session_id;
+
+  if (env.CODEX_THREAD_ID && targetSession !== env.CODEX_THREAD_ID) return {};
+  if (isSubagent && !parentSession) return {};
+  if (isSubagent && event.parent_session_id && env.CODEX_THREAD_ID && event.parent_session_id !== env.CODEX_THREAD_ID) return {};
+
+  const output = await handleHook(event, directory, undefined, undefined, { background: true, env, dependencies });
+  if (isSubagent) return output;
   // Deliver already-known alerts immediately, without delaying them for a probe.
   if (Object.keys(output).length) return output;
   const deadline = Date.now() + (dependencies.budgetMs ?? (BACKGROUND_TIMEOUT_SECONDS - 60) * 1000);

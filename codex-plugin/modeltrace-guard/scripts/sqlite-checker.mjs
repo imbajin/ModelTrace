@@ -212,6 +212,65 @@ export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = 
   return null;
 }
 
+export async function queryLatestRecordsPerSession({ dbPath, sessionIds = [], env = process.env, execFn } = {}) {
+  const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
+  if (!existsSync(targetDb)) return [];
+
+  const uniqueIds = Array.from(new Set(sessionIds.filter((id) => typeof id === 'string' && id.trim().length > 0)));
+  if (!uniqueIds.length) return [];
+
+  if (uniqueIds.length === 1) {
+    const escaped = `'${String(uniqueIds[0]).replace(/'/g, "''")}'`;
+    const sql = `SELECT id, ts, feedback_log_body, thread_id FROM logs WHERE thread_id = ${escaped} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1;`;
+    const rows = await runQuery(targetDb, sql, { execFn });
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  const subqueries = uniqueIds.map((id) => {
+    const escaped = `'${String(id).replace(/'/g, "''")}'`;
+    return `SELECT id, ts, feedback_log_body, thread_id FROM logs WHERE thread_id = ${escaped} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1`;
+  });
+  const sql = subqueries.map((q) => `SELECT * FROM (${q})`).join(' UNION ALL ') + ';';
+  const rows = await runQuery(targetDb, sql, { execFn });
+  return Array.isArray(rows) ? rows : [];
+}
+
+export async function checkSqliteSessions({ dbPath, sessions = [], env = process.env, execFn } = {}) {
+  try {
+    const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
+    if (!existsSync(targetDb)) return { checked: false, reason: 'database_not_found', results: [] };
+    const sessionIds = sessions.map((s) => s.sessionId).filter(Boolean);
+    if (!sessionIds.length) return { checked: true, results: [] };
+    const rows = await queryLatestRecordsPerSession({ dbPath: targetDb, sessionIds, env, execFn });
+    const results = [];
+    for (const sessConfig of sessions) {
+      const row = rows.find((r) => {
+        const tid = (r.thread_id || parseLogBody(r.feedback_log_body).threadId || '').trim();
+        return tid === sessConfig.sessionId || tid.toLowerCase() === sessConfig.sessionId.toLowerCase();
+      });
+      if (!row) {
+        results.push({ sessionId: sessConfig.sessionId, checked: true, record: null, degraded: false });
+        continue;
+      }
+      if (sessConfig.lastLogId !== null && sessConfig.lastLogId !== undefined && row.id <= sessConfig.lastLogId) {
+        results.push({ sessionId: sessConfig.sessionId, checked: true, record: null, alreadySeen: true, degraded: false });
+        continue;
+      }
+      const analysis = analyzeRecord(row, { expectedModel: sessConfig.expectedModel });
+      results.push({
+        sessionId: sessConfig.sessionId,
+        checked: true,
+        degraded: Boolean(analysis?.degraded),
+        reason: analysis?.reason || null,
+        record: analysis,
+      });
+    }
+    return { checked: true, results };
+  } catch (error) {
+    return { checked: false, error: error.message, results: [] };
+  }
+}
+
 export async function checkSqliteLatest({ dbPath, sessionId, expectedModel, lastLogId = null, env = process.env, execFn, allowGlobalFallback = false } = {}) {
   try {
     const targetDb = path.resolve(dbPath || getDefaultDbPath(env));

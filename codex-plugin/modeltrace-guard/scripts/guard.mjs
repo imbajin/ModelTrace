@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LANGUAGES } from './prompts.mjs';
 import { acknowledgeAlerts, pendingAlerts, queueAlert, queueTelemetryAlert, userNotice } from './alerts.mjs';
-import { checkSqliteLatest } from './sqlite-checker.mjs';
+import { checkSqliteLatest, checkSqliteSessions } from './sqlite-checker.mjs';
 import { summarize } from './status.mjs';
 import { dispatchQueuedCleanups, removeSnapshot, requestCleanupSweep } from './fork-snapshot.mjs';
 export { summarize } from './status.mjs';
@@ -54,11 +54,14 @@ export function getBackoffDurationMs(attempt, env = process.env) {
 
 export function controlContext(state, directory, now = Date.now()) {
   if (state.taskHalt) {
-    const hostNote = state.taskHalt.hostError
+    const gapNote = state.lastTelemetryGap
+      ? ` CRITICAL TELEMETRY COVERAGE GAP: SQLite telemetry check failed (${state.lastTelemetryGap.error}). Detection coverage has gaps.`
+      : '';
+    const hostNote = (state.taskHalt.hostError
       ? ` CRITICAL HOST GOAL WARNING: Automatic goal pause failed (${state.taskHalt.hostError}). The active goal may continue scheduling turns unless manually stopped or paused by user.`
       : state.taskHalt.goalPaused
         ? ' Host active goal has been safely paused.'
-        : '';
+        : '') + gapNote;
     if (state.taskHalt.source === 'telemetry') {
       const halt = state.taskHalt;
       if (halt.exhausted) {
@@ -120,20 +123,24 @@ export function isControlCommand(event, isHalted = false) {
 }
 
 function preToolDecision(event, state, directory, now = Date.now()) {
-  if (state?.taskHalt?.source === 'telemetry' && state.taskHalt.pausedUntil && now >= state.taskHalt.pausedUntil && !state.taskHalt.exhausted) {
+  if (state?.taskHalt?.source === 'telemetry' && state.taskHalt.pausedUntil && now >= state.taskHalt.pausedUntil && !state.taskHalt.exhausted && !state.taskHalt.canaryActive && !state.lastTelemetryGap) {
     return {};
   }
   const isHalted = Boolean(state?.taskHalt);
   const reason = state ? notificationContext(state, directory, undefined, now) || controlContext(state, directory, now) : null;
   if (reason && !isControlCommand(event, isHalted)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
+  if (state?.lastTelemetryGap && !isHalted) {
+    const gapNotice = `ModelTrace Guard: 本地 SQLite 遥测检查失败 (${state.lastTelemetryGap.error})。检测覆盖存在缺口。`;
+    return { systemMessage: gapNotice };
+  }
   return {};
 }
 
-async function busyHookFallback(event, directory, error, now = Date.now()) {
+async function busyHookFallback(event, directory, error, now = Date.now(), { dependencies = {}, env = process.env } = {}) {
   if (error.code !== 'MODELTRACE_STATE_BUSY' || !['PreToolUse', 'Stop'].includes(event.hook_event_name)) throw error;
   let state;
   const isSubagent = Boolean(event.agent_id || event.parent_session_id);
-  const targetSession = (isSubagent && process.env.CODEX_THREAD_ID)
+  const targetSession = (isSubagent && env.CODEX_THREAD_ID)
     || event.parent_session_id
     || event.session_id;
   try { state = await readState(directory, targetSession); }
@@ -148,19 +155,81 @@ async function busyHookFallback(event, directory, error, now = Date.now()) {
   const isHalted = Boolean(state?.taskHalt);
   if (event.hook_event_name === 'PreToolUse') return preToolDecision(event, state, directory, now);
   if (!state) return {};
+  if (isHalted) {
+    let hostNote = '';
+    let hostWarning = '';
+    if (!state.taskHalt.goalPaused && !state.taskHalt.hostConfirmed) {
+      try {
+        const pauseRes = await pauseThreadGoal(targetSession, env, { ...dependencies, timeoutMs: dependencies.timeoutMs || 2500 });
+        hostNote = pauseRes.hasGoal ? ' (host active goal paused)' : ' (no active host goal)';
+        await withState(directory, targetSession, (s) => {
+          if (s.taskHalt && s.taskHalt.id === state.taskHalt.id) {
+            s.taskHalt.goalPaused = Boolean(pauseRes.paused);
+            s.taskHalt.hasGoal = Boolean(pauseRes.hasGoal);
+            s.taskHalt.previousGoalStatus = pauseRes.previousStatus;
+            s.taskHalt.hostConfirmed = true;
+            s.taskHalt.hostError = null;
+            if (!event.stop_hook_active && !s.taskHalt.haltStopDelivered) {
+              s.taskHalt.haltStopDelivered = true;
+              if (!isSubagent) s.stopTurn = s.turn || 'no-turn';
+            }
+            record(s, 'host_goal_paused', Date.now(), { halt: s.taskHalt.id, session: s.session, hasGoal: pauseRes.hasGoal });
+          }
+        }, { lockTimeoutMs: 50 }).catch(() => {});
+      } catch (err) {
+        hostWarning = ` CRITICAL HOST GOAL WARNING: Automatic goal pause failed (${err.message}). The active goal may continue scheduling turns unless manually stopped or paused by user.`;
+        await withState(directory, targetSession, (s) => {
+          if (s.taskHalt && s.taskHalt.id === state.taskHalt.id) {
+            s.taskHalt.goalPaused = false;
+            s.taskHalt.hostConfirmed = false;
+            s.taskHalt.hostError = err.message;
+            if (!event.stop_hook_active && !s.taskHalt.haltStopDelivered) {
+              s.taskHalt.haltStopDelivered = true;
+              if (!isSubagent) s.stopTurn = s.turn || 'no-turn';
+            }
+            record(s, 'host_goal_pause_failed', Date.now(), { halt: s.taskHalt.id, session: s.session, error: err.message });
+          }
+        }, { lockTimeoutMs: 50 }).catch(() => {});
+      }
+    }
+    const control = controlContext(state, directory, now);
+    const waiting = pendingAlerts(state);
+    const notice = [waiting.map(userNotice).join('\n'), control].filter(Boolean).join('\n');
+    let message = notice || control || '';
+    if (hostNote && !message.includes('host active goal') && !message.includes('no active host goal')) {
+      message = message.replace(/(\. Stop edits)/, `${hostNote}$1`);
+    }
+    if (hostWarning) message += hostWarning;
+
+    if (!event.stop_hook_active && !state.taskHalt.haltStopDelivered && state.stopTurn !== (state.turn || 'no-turn')) {
+      await withState(directory, targetSession, (s) => {
+        if (s.taskHalt && s.taskHalt.id === state.taskHalt.id) {
+          s.taskHalt.haltStopDelivered = true;
+          if (!isSubagent) s.stopTurn = s.turn || 'no-turn';
+        }
+      }, { lockTimeoutMs: 50 }).catch(() => {});
+      let reason = control || notificationContext(state, directory) || message;
+      if (hostNote && !reason.includes('host active goal') && !reason.includes('no active host goal')) {
+        reason = reason.replace(/(\. Stop edits)/, `${hostNote}$1`);
+      }
+      if (hostWarning) reason += hostWarning;
+      return { continue: false, decision: 'block', reason, systemMessage: message };
+    }
+    return { continue: false, systemMessage: message };
+  }
   const waiting = pendingAlerts(state), control = controlContext(state, directory, now);
-  if (!state.enabled && !waiting.length) return state.taskHalt ? { systemMessage: control } : {};
+  if (!state.enabled && !waiting.length) return {};
   const notice = [waiting.map(userNotice).join('\n'), control].filter(Boolean).join('\n');
   if (!notice) return {};
   const continueOnce = !event.stop_hook_active && state.stopTurn !== (state.turn || 'no-turn')
-    && (waiting.length || state.confirmation?.status === 'active') && !isHalted;
+    && (waiting.length || state.confirmation?.status === 'active');
   return { systemMessage: notice, ...(continueOnce ? { decision: 'block', reason: notificationContext(state, directory) || control } : {}) };
 }
 
-export async function handleHook(event, directory, now = Date.now(), draw = randomInt, { background = false, dependencies = {} } = {}) {
+export async function handleHook(event, directory, now = Date.now(), draw = randomInt, { background = false, dependencies = {}, env = process.env } = {}) {
   if (!event || typeof event.session_id !== 'string' || !event.session_id || event.session_id.length > 256) throw new Error('Missing or invalid session_id in hook input');
   const isSubagent = Boolean(event.agent_id || event.parent_session_id);
-  const targetSession = (isSubagent && process.env.CODEX_THREAD_ID)
+  const targetSession = (isSubagent && env.CODEX_THREAD_ID)
     || event.parent_session_id
     || event.session_id;
   const supported = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'Stop', 'Interrupt', 'SessionEnd'];
@@ -174,7 +243,11 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     if (isSubagent && event.session_id && event.session_id !== targetSession) {
       if (!Array.isArray(state.subagentSessionIds)) state.subagentSessionIds = [];
       if (!state.subagentSessionIds.includes(event.session_id)) {
-        state.subagentSessionIds.push(event.session_id);
+        state.subagentSessionIds = [...state.subagentSessionIds, event.session_id].slice(-50);
+      }
+      if (typeof event.model === 'string' && event.model) {
+        if (!state.subagentModels) state.subagentModels = {};
+        state.subagentModels[event.session_id] = event.model;
       }
     }
     const currentTurn = !isSubagent && setTurn(state, event.turn_id);
@@ -209,111 +282,152 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     }
     if (['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop'].includes(hook)) {
       try {
-        const querySessionId = Array.from(new Set([
+        const trackedSessions = Array.from(new Set([
           targetSession,
           ...(state.subagentSessionIds || []),
-          event.session_id,
-          event.parent_session_id,
+          isSubagent ? event.session_id : null,
         ].filter(Boolean)));
-        const telemetry = await checkSqliteLatest({
-          sessionId: querySessionId.length > 1 ? querySessionId : querySessionId[0],
-          expectedModel: state.expected || state.model,
-          lastLogId: state.lastSqliteLogId,
-        });
-        if (telemetry?.record) {
-          state.lastSqliteLogId = Math.max(state.lastSqliteLogId || 0, telemetry.record.logId);
-          state.lastTelemetry = {
-            at: now,
-            logId: telemetry.record.logId,
-            requestedModel: telemetry.record.requestedModel,
-            fasterModel: telemetry.record.fasterModel,
-            safetyBufferingEnabled: telemetry.record.safetyBufferingEnabled,
-            primaryUsedPercent: telemetry.record.primaryUsedPercent,
-            degraded: telemetry.degraded,
-            reason: telemetry.reason,
-          };
-          if (telemetry.degraded) {
-            if (state.taskHalt) {
-              if (state.taskHalt.source === 'telemetry' && !state.taskHalt.exhausted) {
-                const maxAttempts = Number(process.env.MODELTRACE_BACKOFF_MAX_ATTEMPTS || 3);
-                if (state.taskHalt.attempt < (state.taskHalt.maxAttempts || maxAttempts)) {
-                  const nextAttempt = (state.taskHalt.attempt || 1) + 1;
-                  const durationMs = getBackoffDurationMs(nextAttempt);
-                  state.taskHalt.attempt = nextAttempt;
-                  state.taskHalt.at = now;
-                  state.taskHalt.durationMs = durationMs;
-                  state.taskHalt.pausedUntil = now + durationMs;
-                  state.taskHalt.canaryActive = false;
-                  state.taskHalt.retryCount = state.consecutiveDegradedCount;
-                  state.taskHalt.reason = telemetry.reason;
-                  record(state, 'task_halt_backoff_stepped', now, { ...state.taskHalt });
-                } else {
-                  state.taskHalt.exhausted = true;
-                  state.taskHalt.pausedUntil = null;
-                  state.taskHalt.canaryActive = false;
-                  record(state, 'task_halt_exhausted', now, { ...state.taskHalt });
+        const sessionsConfig = trackedSessions.map((sid) => ({
+          sessionId: sid,
+          expectedModel: sid === targetSession ? (state.expected || state.model) : (state.subagentModels?.[sid] || null),
+          lastLogId: state.lastSqliteLogIds
+            ? (state.lastSqliteLogIds[sid] ?? null)
+            : (sid === targetSession ? state.lastSqliteLogId : null),
+        }));
+        const telemetryBatch = await checkSqliteSessions({ sessions: sessionsConfig, env });
+        if (!telemetryBatch.checked) {
+          const errDetail = telemetryBatch.error || telemetryBatch.reason || 'unknown_error';
+          record(state, 'telemetry_coverage_gap', now, { error: errDetail });
+          state.lastTelemetryGap = { at: now, error: errDetail };
+          if (state.taskHalt) {
+            state.taskHalt.canaryActive = false;
+          }
+        } else {
+          state.lastTelemetryGap = null;
+          for (const res of telemetryBatch.results) {
+            if (!res.record) continue;
+            if (!state.lastSqliteLogIds) state.lastSqliteLogIds = {};
+            state.lastSqliteLogIds[res.sessionId] = Math.max(state.lastSqliteLogIds[res.sessionId] || 0, res.record.logId);
+            state.lastSqliteLogId = Math.max(state.lastSqliteLogId || 0, res.record.logId);
+            if (res.degraded || !state.lastTelemetry || !state.lastTelemetry.degraded) {
+              state.lastTelemetry = {
+                at: now,
+                sessionId: res.sessionId,
+                logId: res.record.logId,
+                requestedModel: res.record.requestedModel,
+                fasterModel: res.record.fasterModel,
+                safetyBufferingEnabled: res.record.safetyBufferingEnabled,
+                primaryUsedPercent: res.record.primaryUsedPercent,
+                degraded: res.degraded,
+                reason: res.reason,
+              };
+            }
+            if (res.degraded) {
+              state.degradedSession = res.sessionId;
+              if (state.taskHalt) {
+                if (state.taskHalt.source === 'telemetry' && !state.taskHalt.exhausted) {
+                  const maxAttempts = Number(env.MODELTRACE_BACKOFF_MAX_ATTEMPTS || 3);
+                  if (state.taskHalt.attempt < (state.taskHalt.maxAttempts || maxAttempts)) {
+                    const nextAttempt = (state.taskHalt.attempt || 1) + 1;
+                    const durationMs = getBackoffDurationMs(nextAttempt, env);
+                    state.taskHalt.attempt = nextAttempt;
+                    state.taskHalt.at = now;
+                    state.taskHalt.durationMs = durationMs;
+                    state.taskHalt.pausedUntil = now + durationMs;
+                    state.taskHalt.canaryActive = false;
+                    state.taskHalt.retryCount = state.consecutiveDegradedCount;
+                    state.taskHalt.reason = res.reason;
+                    state.taskHalt.degradedSession = res.sessionId;
+                    record(state, 'task_halt_backoff_stepped', now, { ...state.taskHalt });
+                  } else {
+                    state.taskHalt.exhausted = true;
+                    state.taskHalt.pausedUntil = null;
+                    state.taskHalt.canaryActive = false;
+                    state.taskHalt.degradedSession = res.sessionId;
+                    record(state, 'task_halt_exhausted', now, { ...state.taskHalt });
+                  }
                 }
+              } else {
+                state.consecutiveDegradedCount = (state.consecutiveDegradedCount || 0) + 1;
+                const threshold = Number(env.MODELTRACE_TELEMETRY_HALT_COUNT || 2);
+                const shouldHalt = state.consecutiveDegradedCount >= threshold;
+                const maxAttempts = Number(env.MODELTRACE_BACKOFF_MAX_ATTEMPTS || 3);
+                if (shouldHalt) {
+                  const durationMs = getBackoffDurationMs(1, env);
+                  state.taskHalt = {
+                    id: `telemetry-halt-${res.record.logId || now}`,
+                    at: now,
+                    source: 'telemetry',
+                    expected: res.sessionId === targetSession ? (state.expected || state.model || res.record.requestedModel) : (state.subagentModels?.[res.sessionId] || res.record.requestedModel),
+                    actual: res.record.fasterModel || 'unknown_faster_model',
+                    retryCount: state.consecutiveDegradedCount,
+                    reason: res.reason,
+                    alertId: `telemetry-${res.record.logId || now}`,
+                    attempt: 1,
+                    maxAttempts,
+                    durationMs,
+                    pausedUntil: now + durationMs,
+                    canaryActive: false,
+                    exhausted: false,
+                    degradedSession: res.sessionId,
+                  };
+                  record(state, 'task_halt_requested', now, { ...state.taskHalt });
+                }
+                queueTelemetryAlert(state, res.record, now, {
+                  consecutiveCount: state.consecutiveDegradedCount,
+                  halted: Boolean(state.taskHalt),
+                  attempt: state.taskHalt?.attempt || 1,
+                  pausedUntil: state.taskHalt?.pausedUntil || null,
+                  durationMinutes: Math.round((state.taskHalt?.durationMs || 15 * 60 * 1000) / 60000),
+                  exhausted: Boolean(state.taskHalt?.exhausted),
+                });
               }
             } else {
-              state.consecutiveDegradedCount = (state.consecutiveDegradedCount || 0) + 1;
-              const threshold = Number(process.env.MODELTRACE_TELEMETRY_HALT_COUNT || 2);
-              const shouldHalt = state.consecutiveDegradedCount >= threshold;
-              const maxAttempts = Number(process.env.MODELTRACE_BACKOFF_MAX_ATTEMPTS || 3);
-              if (shouldHalt) {
-                const durationMs = getBackoffDurationMs(1);
-                state.taskHalt = {
-                  id: `telemetry-halt-${telemetry.record.logId || now}`,
-                  at: now,
-                  source: 'telemetry',
-                  expected: state.expected || state.model || telemetry.record.requestedModel,
-                  actual: telemetry.record.fasterModel || 'unknown_faster_model',
-                  retryCount: state.consecutiveDegradedCount,
-                  reason: telemetry.reason,
-                  alertId: `telemetry-${telemetry.record.logId || now}`,
-                  attempt: 1,
-                  maxAttempts,
-                  durationMs,
-                  pausedUntil: now + durationMs,
-                  canaryActive: false,
-                  exhausted: false,
-                };
-                record(state, 'task_halt_requested', now, { ...state.taskHalt });
+              const degradedSession = state.degradedSession || targetSession;
+              const isDegradedSession = degradedSession === res.sessionId;
+              if (state.taskHalt?.source === 'telemetry' && !state.taskHalt.exhausted && state.taskHalt.canaryActive) {
+                if (isDegradedSession) {
+                  record(state, 'telemetry_recovered', now, {
+                    sessionId: res.sessionId,
+                    logId: res.record.logId,
+                    previousCount: state.consecutiveDegradedCount,
+                    previousAttempt: state.taskHalt.attempt,
+                  });
+                  state.taskHalt = null;
+                  state.consecutiveDegradedCount = 0;
+                  state.degradedSession = null;
+                }
+              } else if (!state.taskHalt && state.consecutiveDegradedCount > 0) {
+                if (isDegradedSession) {
+                  record(state, 'telemetry_recovered', now, {
+                    sessionId: res.sessionId,
+                    logId: res.record.logId,
+                    previousCount: state.consecutiveDegradedCount,
+                  });
+                  state.consecutiveDegradedCount = 0;
+                  state.degradedSession = null;
+                }
               }
-              queueTelemetryAlert(state, telemetry.record, now, {
-                consecutiveCount: state.consecutiveDegradedCount,
-                halted: Boolean(state.taskHalt),
-                attempt: state.taskHalt?.attempt || 1,
-                pausedUntil: state.taskHalt?.pausedUntil || null,
-                durationMinutes: Math.round((state.taskHalt?.durationMs || 15 * 60 * 1000) / 60000),
-                exhausted: Boolean(state.taskHalt?.exhausted),
-              });
-            }
-          } else {
-            if (state.taskHalt?.source === 'telemetry' && !state.taskHalt.exhausted && state.taskHalt.canaryActive) {
-              record(state, 'telemetry_recovered', now, {
-                logId: telemetry.record.logId,
-                previousCount: state.consecutiveDegradedCount,
-                previousAttempt: state.taskHalt.attempt,
-              });
-              state.taskHalt = null;
-              state.consecutiveDegradedCount = 0;
-            } else if (!state.taskHalt && state.consecutiveDegradedCount > 0) {
-              record(state, 'telemetry_recovered', now, {
-                logId: telemetry.record.logId,
-                previousCount: state.consecutiveDegradedCount,
-              });
-              state.consecutiveDegradedCount = 0;
             }
           }
         }
-      } catch {}
+      } catch (err) {
+        record(state, 'telemetry_coverage_gap', now, { error: err.message });
+        state.lastTelemetryGap = { at: now, error: err.message };
+        if (state.taskHalt) {
+          state.taskHalt.canaryActive = false;
+        }
+      }
     }
     const turnKey = state.turn || 'no-turn';
     const waiting = pendingAlerts(state);
     if (hook === 'PreToolUse') {
       if (state.taskHalt?.source === 'telemetry' && state.taskHalt.pausedUntil && now >= state.taskHalt.pausedUntil && !state.taskHalt.exhausted) {
-        state.taskHalt.canaryActive = true;
-        return {};
+        if (!state.taskHalt.canaryActive && !state.lastTelemetryGap) {
+          state.taskHalt.canaryActive = true;
+          record(state, 'canary_check_issued', now, { halt: state.taskHalt.id, attempt: state.taskHalt.attempt });
+          return {};
+        }
       }
       if (state.taskHalt && !state.taskHalt.goalPaused && !state.taskHalt.hostConfirmed) {
         haltNeedsPause = true;
@@ -332,6 +446,10 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
         output = hook === 'Stop'
           ? { continue: false, ...output, systemMessage: context }
           : { ...output, ...injected(hook, context), systemMessage: context };
+      }
+      if (state.lastTelemetryGap && !state.taskHalt) {
+        const gapNotice = `ModelTrace Guard: 本地 SQLite 遥测检查失败 (${state.lastTelemetryGap.error})。检测覆盖存在缺口。`;
+        output.systemMessage = [output.systemMessage, gapNotice].filter(Boolean).join('\n');
       }
       const batch = waiting.filter((alert) => force || alert.lastDeliveryTurn !== turnKey).slice(0, 5);
       if (!batch.length) return output;
@@ -425,10 +543,10 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     if (expired) return deliver({ systemMessage: 'ModelTrace Guard: a background checkpoint expired. Coverage gap recorded; work may continue.' });
     if (!isSubagent) issue(state, now, draw);
     return deliver({}, hook === 'SessionStart');
-  }, background ? BACKGROUND_STATE_LOCK : undefined).catch((error) => busyHookFallback(event, directory, error, now));
+  }, background ? BACKGROUND_STATE_LOCK : undefined).catch((error) => busyHookFallback(event, directory, error, now, { dependencies, env }));
   if (haltNeedsPause && haltId) {
     try {
-      const pauseRes = await pauseThreadGoal(targetSession, process.env, dependencies);
+      const pauseRes = await pauseThreadGoal(targetSession, env, { ...dependencies, timeoutMs: dependencies.timeoutMs || 2500 });
       await withState(directory, targetSession, (state) => {
         if (state.taskHalt && state.taskHalt.id === haltId) {
           state.taskHalt.goalPaused = Boolean(pauseRes.paused);
@@ -539,13 +657,14 @@ export async function run(args, env = process.env, receipt = null) {
   if (command === 'hook' || command === 'background-hook') {
     const event = await stdinJson();
     if (env.MODELTRACE_PROBE_PROCESS === '1') return event.hook_event_name === 'PreToolUse' ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'ModelTrace disposable probes are text-only; no tools or original task work are allowed.' } } : {};
-    const rootSession = event.parent_session_id || event.session_id;
+    const isSubagent = Boolean(event.agent_id || event.parent_session_id);
+    const rootSession = (isSubagent && env.CODEX_THREAD_ID) || event.parent_session_id || event.session_id;
     if (env.CODEX_THREAD_ID && rootSession !== env.CODEX_THREAD_ID && event.session_id !== env.CODEX_THREAD_ID) return {};
     if (command === 'background-hook') {
       const { handleBackgroundHook } = await import('./background.mjs');
-      return handleBackgroundHook(event, directory, env);
+      return handleBackgroundHook(event, directory, env, receipt?.dependencies);
     }
-    return handleHook(event, directory, undefined, undefined, { dependencies: receipt?.dependencies });
+    return handleHook(event, directory, undefined, undefined, { dependencies: receipt?.dependencies, env });
   }
   if (command === 'dashboard' || command === 'dashboard-stop') {
     const { launchDashboard, stopDashboard } = await import('./dashboard.mjs');
@@ -658,6 +777,7 @@ export async function run(args, env = process.env, receipt = null) {
       record(state, 'task_resumed', now, { halt: state.taskHalt.id, forced: isForced });
       state.taskHalt = null;
       state.consecutiveDegradedCount = 0;
+      state.degradedSession = null;
       schedule(state, now);
       return summarize(state, directory, now);
     });
@@ -730,4 +850,9 @@ const isDirectCall = (entryUrl) => {
   try { return existsSync(process.argv[1]) && realpathSync(process.argv[1]) === target; } catch { return false; }
 };
 
-if (isDirectCall(import.meta.url)) await main();
+if (isDirectCall(import.meta.url)) {
+  main().catch((err) => {
+    process.stderr.write(String(err?.stack || err) + '\n');
+    process.exit(1);
+  });
+}
