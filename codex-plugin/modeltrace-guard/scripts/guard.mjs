@@ -129,10 +129,14 @@ function preToolDecision(event, state, directory, now = Date.now()) {
   return {};
 }
 
-async function busyHookFallback(event, directory, error) {
+async function busyHookFallback(event, directory, error, now = Date.now()) {
   if (error.code !== 'MODELTRACE_STATE_BUSY' || !['PreToolUse', 'Stop'].includes(event.hook_event_name)) throw error;
   let state;
-  try { state = await readState(directory, event.session_id); }
+  const isSubagent = Boolean(event.agent_id || event.parent_session_id);
+  const targetSession = (isSubagent && process.env.CODEX_THREAD_ID)
+    || event.parent_session_id
+    || event.session_id;
+  try { state = await readState(directory, targetSession); }
   catch {
     const reason = 'ModelTrace Guard: task state is unavailable; pause work and tell the user. Retry the state check before continuing. This is a monitoring error, not a model mismatch.';
     if (event.hook_event_name === 'PreToolUse' && !isControlCommand(event)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
@@ -142,9 +146,9 @@ async function busyHookFallback(event, directory, error) {
   // policy without taking or stealing the busy writer's lease. Do not change
   // counts, acknowledge alerts or clear a halt on this read-only path.
   const isHalted = Boolean(state?.taskHalt);
-  if (event.hook_event_name === 'PreToolUse') return preToolDecision(event, state, directory, Date.now());
+  if (event.hook_event_name === 'PreToolUse') return preToolDecision(event, state, directory, now);
   if (!state) return {};
-  const waiting = pendingAlerts(state), control = controlContext(state, directory, Date.now());
+  const waiting = pendingAlerts(state), control = controlContext(state, directory, now);
   if (!state.enabled && !waiting.length) return state.taskHalt ? { systemMessage: control } : {};
   const notice = [waiting.map(userNotice).join('\n'), control].filter(Boolean).join('\n');
   if (!notice) return {};
@@ -155,17 +159,25 @@ async function busyHookFallback(event, directory, error) {
 
 export async function handleHook(event, directory, now = Date.now(), draw = randomInt, { background = false, dependencies = {} } = {}) {
   if (!event || typeof event.session_id !== 'string' || !event.session_id || event.session_id.length > 256) throw new Error('Missing or invalid session_id in hook input');
-  // No subagent samples may be submitted as root-task evidence.
-  if (event.agent_id || event.parent_session_id) return {};
+  const isSubagent = Boolean(event.agent_id || event.parent_session_id);
+  const targetSession = (isSubagent && process.env.CODEX_THREAD_ID)
+    || event.parent_session_id
+    || event.session_id;
   const supported = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'Stop', 'Interrupt', 'SessionEnd'];
   if (!supported.includes(event.hook_event_name)) return {};
   let haltNeedsPause = false, haltId = null;
-  const hookOutput = await withState(directory, event.session_id, async (state) => {
+  const hookOutput = await withState(directory, targetSession, async (state) => {
     const hook = event.hook_event_name;
     state.lastHookAt = now;
     if (background) state.lastBackgroundHookAt = now;
     state.hooksSeen += 1;
-    const currentTurn = setTurn(state, event.turn_id);
+    if (isSubagent && event.session_id && event.session_id !== targetSession) {
+      if (!Array.isArray(state.subagentSessionIds)) state.subagentSessionIds = [];
+      if (!state.subagentSessionIds.includes(event.session_id)) {
+        state.subagentSessionIds.push(event.session_id);
+      }
+    }
+    const currentTurn = !isSubagent && setTurn(state, event.turn_id);
     if (currentTurn && ['SessionStart', 'UserPromptSubmit'].includes(hook)) { state.runtimePaused = false; state.runtimeEndedAt = null; }
     if (currentTurn && hook === 'SessionStart' && ['startup', 'resume'].includes(event.source)) {
       requestCleanupSweep(directory);
@@ -195,10 +207,16 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
         if (state.enabled && oldModel) segment(state, now, 'reported_model_changed', draw);
       }
     }
-    if (['UserPromptSubmit', 'Stop'].includes(hook)) {
+    if (['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop'].includes(hook)) {
       try {
+        const querySessionId = Array.from(new Set([
+          targetSession,
+          ...(state.subagentSessionIds || []),
+          event.session_id,
+          event.parent_session_id,
+        ].filter(Boolean)));
         const telemetry = await checkSqliteLatest({
-          sessionId: event.session_id,
+          sessionId: querySessionId.length > 1 ? querySessionId : querySessionId[0],
           expectedModel: state.expected || state.model,
           lastLogId: state.lastSqliteLogId,
         });
@@ -317,8 +335,10 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       }
       const batch = waiting.filter((alert) => force || alert.lastDeliveryTurn !== turnKey).slice(0, 5);
       if (!batch.length) return output;
-      for (const alert of batch) {
-        alert.deliveryCount += 1; alert.lastDeliveredAt = now; alert.lastDeliveryTurn = turnKey;
+      if (!isSubagent) {
+        for (const alert of batch) {
+          alert.deliveryCount += 1; alert.lastDeliveredAt = now; alert.lastDeliveryTurn = turnKey;
+        }
       }
       const context = notificationContext(state, directory, batch, now);
       const notice = batch.map(userNotice).join('\n');
@@ -332,6 +352,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     // 只要执行了工具，必须如实累加工具调用计数 workTools 并初始化 nextTools。
     // 彻底解决原版在第 205 行因 !state.enabled 提前 return 导致 workTools 永远为 0、永不采样的漏洞。
     if (hook === 'PostToolUse' && !ownCommand(event)) {
+      if (isSubagent) return deliver({});
       if (event.tool_use_id && state.seenTools.includes(event.tool_use_id)) return deliver({});
       if (event.tool_use_id) state.seenTools = [...state.seenTools.slice(-255), event.tool_use_id];
       state.workTools += 1;
@@ -385,7 +406,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
         return deliver({}, true);
       }
       if (state.taskHalt) {
-        state.stopTurn = state.turn || 'no-turn';
+        if (!isSubagent) state.stopTurn = state.turn || 'no-turn';
         if (!state.taskHalt.haltStopDelivered) {
           state.taskHalt.haltStopDelivered = true;
           return deliver({ continue: false, decision: 'block', reason: controlContext(state, directory) || notificationContext(state, directory) }, true);
@@ -395,19 +416,20 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       // Normal probes never delay the final answer or lose ownership at Stop.
       // Only an actionable alert/confirmation warrants a bounded continuation.
       if (waiting.length || state.confirmation?.status === 'active') {
+        if (isSubagent) return deliver({});
         state.stopTurn = state.turn || 'no-turn';
         return deliver({ decision: 'block', reason: controlContext(state, directory) || notificationContext(state, directory) }, true);
       }
       return deliver(expired ? { systemMessage: 'ModelTrace Guard: a checkpoint was missed. Use status for details.' } : {});
     }
     if (expired) return deliver({ systemMessage: 'ModelTrace Guard: a background checkpoint expired. Coverage gap recorded; work may continue.' });
-    issue(state, now, draw);
+    if (!isSubagent) issue(state, now, draw);
     return deliver({}, hook === 'SessionStart');
-  }, background ? BACKGROUND_STATE_LOCK : undefined).catch((error) => busyHookFallback(event, directory, error));
+  }, background ? BACKGROUND_STATE_LOCK : undefined).catch((error) => busyHookFallback(event, directory, error, now));
   if (haltNeedsPause && haltId) {
     try {
-      const pauseRes = await pauseThreadGoal(event.session_id, process.env, dependencies);
-      await withState(directory, event.session_id, (state) => {
+      const pauseRes = await pauseThreadGoal(targetSession, process.env, dependencies);
+      await withState(directory, targetSession, (state) => {
         if (state.taskHalt && state.taskHalt.id === haltId) {
           state.taskHalt.goalPaused = Boolean(pauseRes.paused);
           state.taskHalt.hasGoal = Boolean(pauseRes.hasGoal);
@@ -429,7 +451,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
         }
       }
     } catch (error) {
-      await withState(directory, event.session_id, (state) => {
+      await withState(directory, targetSession, (state) => {
         if (state.taskHalt && state.taskHalt.id === haltId) {
           state.taskHalt.goalPaused = false;
           state.taskHalt.hostConfirmed = false;
@@ -517,7 +539,8 @@ export async function run(args, env = process.env, receipt = null) {
   if (command === 'hook' || command === 'background-hook') {
     const event = await stdinJson();
     if (env.MODELTRACE_PROBE_PROCESS === '1') return event.hook_event_name === 'PreToolUse' ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'ModelTrace disposable probes are text-only; no tools or original task work are allowed.' } } : {};
-    if (env.CODEX_THREAD_ID && event.session_id !== env.CODEX_THREAD_ID) return {};
+    const rootSession = event.parent_session_id || event.session_id;
+    if (env.CODEX_THREAD_ID && rootSession !== env.CODEX_THREAD_ID && event.session_id !== env.CODEX_THREAD_ID) return {};
     if (command === 'background-hook') {
       const { handleBackgroundHook } = await import('./background.mjs');
       return handleBackgroundHook(event, directory, env);

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -15,7 +15,7 @@ import {
 import { queueTelemetryAlert, userNotice, pendingAlerts, acknowledgeAlerts } from '../scripts/alerts.mjs';
 import { handleHook, ROOT, isControlCommand, run } from '../scripts/guard.mjs';
 import { handleBackgroundHook } from '../scripts/background.mjs';
-import { newState, withState, readState } from '../scripts/state.mjs';
+import { newState, withState, readState, sessionPath } from '../scripts/state.mjs';
 
 async function tempDir(t) {
   const dir = await mkdtemp(path.join(tmpdir(), 'modeltrace-sqlite-test-'));
@@ -283,50 +283,29 @@ test('handleHook fast-fails on PreToolUse when SQLite records server-side degrad
     body: 'turn{thread.id=session-fast-fail model=gpt-6-astra}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-5.6-luna", "x-codex-primary-used-percent": "88"}',
   });
 
-  // Tool hooks (PreToolUse / PostToolUse) do NOT poll SQLite
-  const unpolledPreTool = await handleHook(
-    { session_id: sessionId, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } },
-    dataDir,
-    1001
-  );
-  assert.deepEqual(unpolledPreTool, {});
-  const unpolledPostTool = await handleHook(
-    { session_id: sessionId, hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } },
-    dataDir,
-    1002
-  );
-  assert.deepEqual(unpolledPostTool, {});
-  const unpolledBgPostTool = await handleBackgroundHook(
-    { session_id: sessionId, hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } },
-    dataDir
-  );
-  assert.deepEqual(unpolledBgPostTool, {});
-  const stateBeforeChat = await readState(dataDir, sessionId);
-  assert.equal(stateBeforeChat.lastSqliteLogId, undefined);
-  assert.equal(pendingAlerts(stateBeforeChat).length, 0);
-
-  // Step 3: Chat event (UserPromptSubmit via handleBackgroundHook as in hooks.json) checks SQLite and triggers alert
-  const chatHook = await handleBackgroundHook(
-    { session_id: sessionId, hook_event_name: 'UserPromptSubmit' },
-    dataDir
-  );
-  assert.ok(chatHook.systemMessage?.includes('本地 SQLite 遥测发现服务端降级指令'));
-
-  // Step 4: Next PreToolUse must FAST-FAIL and deny the tool due to pending alert
+  // Step 3: Tool hook PreToolUse actively polls SQLite during continuous turn, immediately detecting degradation and denying tool
   const blockedPreTool = await handleHook(
     { session_id: sessionId, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rm -rf /' } },
     dataDir,
-    1004
+    1001
   );
   assert.equal(blockedPreTool.hookSpecificOutput?.permissionDecision, 'deny');
   assert.ok(blockedPreTool.hookSpecificOutput?.permissionDecisionReason.includes('gpt-5.6-luna'));
   assert.ok(blockedPreTool.systemMessage.includes('本地 SQLite 遥测发现服务端降级指令'));
 
-  // Step 5: Verify state was updated with lastSqliteLogId and alert
+  // Step 4: Verify state was updated with lastSqliteLogId and alert during PreToolUse
   const stateAfterBlock = await readState(dataDir, sessionId);
   assert.equal(stateAfterBlock.lastSqliteLogId, 50);
   assert.equal(stateAfterBlock.alerts.length, 1);
   assert.equal(pendingAlerts(stateAfterBlock).length, 1);
+
+  // Step 5: PostToolUse also delivers pending alert
+  const postTool = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } },
+    dataDir,
+    1002
+  );
+  assert.ok(postTool.systemMessage?.includes('本地 SQLite 遥测发现服务端降级指令'));
 
   // Step 6: Stop hook also blocks turn while alert is pending
   const stopResult = await handleHook(
@@ -666,4 +645,369 @@ test('exponential backoff progression: 15m -> 30m -> 60m -> exhausted and force 
   assert.equal(state.taskHalt, null);
   assert.equal(state.consecutiveDegradedCount, 0);
 });
+
+test('queryLatestRecord supports array of session IDs (subagent and parent session)', async (t) => {
+  const dir = await tempDir(t);
+  const dbFile = path.join(dir, 'array_logs.sqlite');
+  initTestDb(dbFile);
+
+  insertTestLog(dbFile, {
+    id: 10,
+    ts: 1789640010,
+    threadId: 'parent-thread',
+    body: 'turn{thread.id=parent-thread model=gpt-6-astra}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"server": "cloudflare"}',
+  });
+  insertTestLog(dbFile, {
+    id: 11,
+    ts: 1789640020,
+    threadId: 'child-subagent',
+    body: 'turn{thread.id=child-subagent model=gpt-6-astra}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"}',
+  });
+
+  const row = await queryLatestRecord({
+    dbPath: dbFile,
+    sessionId: ['child-subagent', 'parent-thread'],
+  });
+  assert.ok(row);
+  assert.equal(row.id, 11);
+
+  const analysis = analyzeRecord(row, { expectedModel: 'gpt-6-astra' });
+  assert.equal(analysis.degraded, true);
+  assert.equal(analysis.fasterModel, 'gpt-5.6-luna');
+});
+
+test('subagent PreToolUse polls SQLite and fast-fails if subagent request is degraded', async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'guard-data');
+  const dbFile = path.join(dir, 'subagent_logs.sqlite');
+  initTestDb(dbFile);
+  const parentSession = 'parent-session-1';
+  const childSession = 'child-subagent-1';
+
+  const originalDb = process.env.CODEX_LOGS_DB;
+  process.env.CODEX_LOGS_DB = dbFile;
+  t.after(() => {
+    if (originalDb === undefined) delete process.env.CODEX_LOGS_DB;
+    else process.env.CODEX_LOGS_DB = originalDb;
+  });
+
+  await withState(dataDir, parentSession, (s) => {
+    s.enabled = true;
+    s.model = 'gpt-6-astra';
+    s.expected = 'gpt-6-astra';
+  });
+
+  // Insert degraded subagent log
+  insertTestLog(dbFile, {
+    id: 501,
+    ts: 1789640050,
+    threadId: childSession,
+    body: 'turn{thread.id=child-subagent-1 model=gpt-6-astra}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"}',
+  });
+
+  // Subagent PreToolUse hook arrives with parent_session_id
+  const subagentPreTool = await handleHook({
+    session_id: childSession,
+    parent_session_id: parentSession,
+    agent_id: 'subagent-worker',
+    hook_event_name: 'PreToolUse',
+    tool_name: 'Bash',
+    tool_input: { command: 'npm test' },
+  }, dataDir, 2000);
+
+  // Must be intercepted and denied!
+  assert.equal(subagentPreTool.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.ok(subagentPreTool.hookSpecificOutput?.permissionDecisionReason.includes('gpt-5.6-luna'));
+
+  // Parent task state must be updated
+  const parentState = await readState(dataDir, parentSession);
+  assert.equal(parentState.lastSqliteLogId, 501);
+  assert.equal(pendingAlerts(parentState).length, 1);
+});
+
+test('subagent PreToolUse is denied when parent session is in taskHalt', async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'guard-data');
+  const parentSession = 'halted-parent-session';
+  const childSession = 'subagent-child';
+
+  await withState(dataDir, parentSession, (s) => {
+    s.enabled = true;
+    s.model = 'gpt-6.1-sol';
+    s.expected = 'gpt-6.1-sol';
+    s.taskHalt = {
+      id: 'telemetry-halt-test',
+      at: 1000,
+      source: 'telemetry',
+      expected: 'gpt-6.1-sol',
+      actual: 'gpt-6-luna',
+      retryCount: 2,
+      reason: 'Safety Buffering',
+      pausedUntil: 9999999999,
+      attempt: 1,
+      maxAttempts: 3,
+    };
+  });
+
+  const res = await handleHook({
+    session_id: childSession,
+    parent_session_id: parentSession,
+    agent_id: 'subagent-worker',
+    hook_event_name: 'PreToolUse',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo hello' },
+  }, dataDir, 2000);
+
+  assert.equal(res.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.ok(res.hookSpecificOutput?.permissionDecisionReason.includes('STOP THE ORIGINAL TASK NOW'));
+});
+
+test('continuous turn with multiple tool executions halts immediately on consecutive degradation without Stop hook', async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'guard-data');
+  const dbFile = path.join(dir, 'turn_logs.sqlite');
+  initTestDb(dbFile);
+  const sessionId = 'session-continuous-turn';
+
+  const originalDb = process.env.CODEX_LOGS_DB;
+  process.env.CODEX_LOGS_DB = dbFile;
+  t.after(() => {
+    if (originalDb === undefined) delete process.env.CODEX_LOGS_DB;
+    else process.env.CODEX_LOGS_DB = originalDb;
+  });
+
+  await withState(dataDir, sessionId, (s) => {
+    s.enabled = true;
+    s.model = 'gpt-6.1-sol';
+    s.expected = 'gpt-6.1-sol';
+  });
+
+  // Turn starts with UserPromptSubmit
+  await handleHook({ session_id: sessionId, hook_event_name: 'UserPromptSubmit', turn_id: 'turn-continuous' }, dataDir, 1000);
+
+  // Tool 1 executes normally (healthy response in SQLite)
+  insertTestLog(dbFile, {
+    id: 1,
+    ts: 1789640001,
+    threadId: sessionId,
+    body: 'turn{thread.id=session-continuous-turn model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"server": "cloudflare"}',
+  });
+  const tool1Pre = await handleHook({ session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-continuous', tool_name: 'Bash', tool_input: { command: 'step 1' } }, dataDir, 1001);
+  assert.deepEqual(tool1Pre, {});
+  await handleHook({ session_id: sessionId, hook_event_name: 'PostToolUse', turn_id: 'turn-continuous', tool_name: 'Bash', tool_input: { command: 'step 1' } }, dataDir, 1002);
+
+  // Degradation #1 occurs before Tool 2
+  insertTestLog(dbFile, {
+    id: 2,
+    ts: 1789640002,
+    threadId: sessionId,
+    body: 'turn{thread.id=session-continuous-turn model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}',
+  });
+  const tool2Pre = await handleHook({ session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-continuous', tool_name: 'Bash', tool_input: { command: 'step 2' } }, dataDir, 1003);
+  assert.equal(tool2Pre.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.ok(tool2Pre.systemMessage.includes('本地 SQLite 遥测发现服务端降级指令'));
+
+  // Acknowledge alert 1
+  let state = await readState(dataDir, sessionId);
+  await withState(dataDir, sessionId, (s) => {
+    acknowledgeAlerts(s, [state.alerts[0].id], 1004);
+  });
+
+  // Degradation #2 occurs before Tool 3 -> Triggers taskHalt immediately on PreToolUse!
+  insertTestLog(dbFile, {
+    id: 3,
+    ts: 1789640003,
+    threadId: sessionId,
+    body: 'turn{thread.id=session-continuous-turn model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}',
+  });
+  const tool3Pre = await handleHook({ session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-continuous', tool_name: 'Bash', tool_input: { command: 'step 3' } }, dataDir, 1005);
+  assert.equal(tool3Pre.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.ok(tool3Pre.hookSpecificOutput?.permissionDecisionReason.includes('STOP THE ORIGINAL TASK NOW'));
+
+  state = await readState(dataDir, sessionId);
+  assert.ok(state.taskHalt);
+  assert.equal(state.consecutiveDegradedCount, 2);
+  assert.equal(state.taskHalt.source, 'telemetry');
+});
+
+test('subagent PreToolUse under busy lock respects parent taskHalt', { timeout: 10000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'guard-data');
+  const parentSession = 'busy-parent-session';
+  const childSession = 'busy-child-subagent';
+
+  await withState(dataDir, parentSession, (s) => {
+    s.enabled = true;
+    s.model = 'gpt-6.1-sol';
+    s.expected = 'gpt-6.1-sol';
+    s.taskHalt = {
+      id: 'telemetry-halt-busy',
+      at: 1000,
+      source: 'telemetry',
+      expected: 'gpt-6.1-sol',
+      actual: 'gpt-6-luna',
+      retryCount: 2,
+      reason: 'Safety Buffering',
+      pausedUntil: 9999999999,
+      attempt: 1,
+      maxAttempts: 3,
+    };
+  });
+
+  // Create a lock file simulating concurrent state writing on parent session
+  const lockFile = sessionPath(dataDir, parentSession) + '.lock';
+  await writeFile(lockFile, JSON.stringify({ pid: process.pid, nonce: 'busy-test-lock', at: Date.now() }));
+
+  // Subagent PreToolUse hook arrives while parent state is busy
+  const res = await handleHook({
+    session_id: childSession,
+    parent_session_id: parentSession,
+    agent_id: 'subagent-worker',
+    hook_event_name: 'PreToolUse',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo hello' },
+  }, dataDir, 2000);
+
+  // Must be denied via busyHookFallback reading parent state, NOT silently allowed!
+  assert.equal(res.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.ok(res.hookSpecificOutput?.permissionDecisionReason.includes('STOP THE ORIGINAL TASK NOW'));
+});
+
+test('root session PreToolUse detects earlier subagent degradation via subagentSessionIds', async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'guard-data');
+  const dbFile = path.join(dir, 'cross_thread_logs.sqlite');
+  initTestDb(dbFile);
+  const parentSession = 'cross-parent-session';
+  const subagentSession = 'cross-subagent-worker';
+
+  const originalDb = process.env.CODEX_LOGS_DB;
+  process.env.CODEX_LOGS_DB = dbFile;
+  t.after(() => {
+    if (originalDb === undefined) delete process.env.CODEX_LOGS_DB;
+    else process.env.CODEX_LOGS_DB = originalDb;
+  });
+
+  await withState(dataDir, parentSession, (s) => {
+    s.enabled = true;
+    s.model = 'gpt-6.1-sol';
+    s.expected = 'gpt-6.1-sol';
+  });
+
+  // Subagent registers by running a hook
+  await handleHook({
+    session_id: subagentSession,
+    parent_session_id: parentSession,
+    agent_id: 'worker-1',
+    hook_event_name: 'PreToolUse',
+    tool_name: 'Bash',
+    tool_input: { command: 'step 1' },
+  }, dataDir, 1000);
+
+  // Subagent completes a degraded response in SQLite
+  insertTestLog(dbFile, {
+    id: 601,
+    ts: 1789640060,
+    threadId: subagentSession,
+    body: 'turn{thread.id=cross-subagent-worker model=gpt-6.1-sol}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"x-codex-safety-buffering-enabled": "true", "x-codex-safety-buffering-faster-model": "gpt-6-luna"}',
+  });
+
+  // Root task executes PreToolUse without parent_session_id
+  const rootPreTool = await handleHook({
+    session_id: parentSession,
+    hook_event_name: 'PreToolUse',
+    tool_name: 'Bash',
+    tool_input: { command: 'root work' },
+  }, dataDir, 1001);
+
+  // Must detect the subagent's degradation and deny root tool!
+  assert.equal(rootPreTool.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.ok(rootPreTool.systemMessage.includes('本地 SQLite 遥测发现服务端降级指令'));
+});
+
+test('subagent delivery does not burn parent alert turn', async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'guard-data');
+  const parentSession = 'parent-alert-turn-session';
+  const subagentSession = 'child-subagent-turn';
+
+  await withState(dataDir, parentSession, (s) => {
+    s.enabled = true;
+    s.model = 'gpt-6-astra';
+    s.expected = 'gpt-6-astra';
+    s.turn = 'turn-main-1';
+  });
+
+  // Inject a telemetry alert
+  await withState(dataDir, parentSession, (s) => {
+    queueTelemetryAlert(s, {
+      logId: 701,
+      requestedModel: 'gpt-6-astra',
+      fasterModel: 'gpt-5.6-luna',
+      reason: 'Safety Buffering',
+    }, 1000);
+  });
+
+  // Subagent runs PostToolUse
+  await handleHook({
+    session_id: subagentSession,
+    parent_session_id: parentSession,
+    agent_id: 'worker',
+    hook_event_name: 'PostToolUse',
+    turn_id: 'subagent-turn-x',
+    tool_name: 'Bash',
+    tool_input: { command: 'ls' },
+  }, dataDir, 1001);
+
+  // Alert deliveryTurn must NOT have been marked as delivered for the parent's turn
+  const stateAfterSubagent = await readState(dataDir, parentSession);
+  assert.notEqual(stateAfterSubagent.alerts[0].lastDeliveryTurn, 'turn-main-1');
+
+  // Parent Stop hook arrives: must still block and deliver notice to human user!
+  const stopRes = await handleHook({
+    session_id: parentSession,
+    hook_event_name: 'Stop',
+    turn_id: 'turn-main-1',
+  }, dataDir, 1002);
+
+  assert.equal(stopRes.decision, 'block');
+  assert.ok(stopRes.systemMessage?.includes('本地 SQLite 遥测发现服务端降级指令'));
+});
+
+test('queryLatestRecord with empty session ID returns null when allowGlobalFallback is false', async (t) => {
+  const dir = await tempDir(t);
+  const dbFile = path.join(dir, 'empty_session.sqlite');
+  initTestDb(dbFile);
+
+  insertTestLog(dbFile, {
+    id: 1,
+    ts: 1789640001,
+    threadId: 'other-session',
+    body: 'turn{thread.id=other-session model=gpt-6-astra}: Request completed method=POST url=https://chatgpt.com/backend-api/codex/responses status=200 headers={"server": "cloudflare"}',
+  });
+
+  const resNull = await queryLatestRecord({
+    dbPath: dbFile,
+    sessionId: null,
+    allowGlobalFallback: false,
+  });
+  assert.equal(resNull, null);
+
+  const resEmptyArr = await queryLatestRecord({
+    dbPath: dbFile,
+    sessionId: [],
+    allowGlobalFallback: false,
+  });
+  assert.equal(resEmptyArr, null);
+
+  const resFallback = await queryLatestRecord({
+    dbPath: dbFile,
+    sessionId: null,
+    allowGlobalFallback: true,
+  });
+  assert.ok(resFallback);
+  assert.equal(resFallback.id, 1);
+});
+
+
 

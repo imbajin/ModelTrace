@@ -194,13 +194,17 @@ export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = 
   const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
   if (!existsSync(targetDb)) return null;
 
-  if (sessionId) {
-    const escapedSessionId = String(sessionId).replace(/'/g, "''");
-    const sql = `SELECT id, ts, feedback_log_body FROM logs WHERE thread_id = '${escapedSessionId}' AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1;`;
+  const sessionIds = Array.from(new Set((Array.isArray(sessionId) ? sessionId : [sessionId]).filter((id) => typeof id === 'string' && id.trim().length > 0)));
+  if (sessionIds.length > 0) {
+    const list = sessionIds.map((id) => `'${String(id).replace(/'/g, "''")}'`).join(', ');
+    const clause = sessionIds.length === 1 ? `thread_id = ${list}` : `thread_id IN (${list})`;
+    const sql = `SELECT id, ts, feedback_log_body FROM logs WHERE ${clause} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1;`;
     const rows = await runQuery(targetDb, sql, { execFn });
     if (Array.isArray(rows) && rows.length > 0) return rows[0];
     if (!allowGlobalFallback) return null;
   }
+
+  if (!allowGlobalFallback) return null;
 
   const sql = `SELECT id, ts, feedback_log_body FROM logs WHERE target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY id DESC LIMIT 1;`;
   const rows = await runQuery(targetDb, sql, { execFn });
