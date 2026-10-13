@@ -40,7 +40,12 @@ export class AppServerClient {
       this.failure = error;
       rejectPending(error);
       this.lines?.close();
-      child.kill();
+      try { child.kill('SIGTERM'); } catch {}
+    };
+    this.fail = fail;
+    this.destroy = (error) => {
+      fail(error || new Error('AppServerClient destroyed'));
+      try { child.kill('SIGKILL'); } catch {}
     };
     this.exited = new Promise((resolve) => {
       const finish = () => {
@@ -54,7 +59,9 @@ export class AppServerClient {
     this.lines = readProtocolLines(child.stdout, (message) => {
       const waiting = this.pending.get(message.id);
       if (waiting && !message.method) {
-        this.pending.delete(message.id); clearTimeout(waiting.timer);
+        this.pending.delete(message.id);
+        clearTimeout(waiting.timer);
+        if (waiting.onAbort && waiting.signal) waiting.signal.removeEventListener('abort', waiting.onAbort);
         if (message.error) {
           if (waiting.method === 'turn/start') this.allowedTurns.delete(waiting.threadId);
           waiting.reject(new Error(`Codex ${waiting.method}: ${message.error.message}`));
@@ -78,30 +85,60 @@ export class AppServerClient {
     child.stdin.on('error', (error) => { if (!this.closing) fail(error); });
   }
   write(message) { if (this.failure) throw this.failure; if (!this.closed) this.child.stdin.write(JSON.stringify(message) + '\n'); }
-  request(method, params = {}, timeout = 15000) {
+  request(method, params = {}, timeout = 15000, options = {}) {
     if (this.failure) return Promise.reject(this.failure);
     if (this.closed) return Promise.reject(new Error('Codex probe transport is closed'));
+    if (options?.signal?.aborted) return Promise.reject(new Error(`Codex ${method} aborted`));
     if (method === 'turn/start') this.allowedTurns.add(params.threadId);
     return new Promise((resolve, reject) => {
       const id = ++this.nextId;
-      const timer = setTimeout(() => { this.pending.delete(id); if (method === 'turn/start') this.allowedTurns.delete(params.threadId); reject(new Error(`Codex ${method} timed out`)); }, timeout);
-      this.pending.set(id, { resolve, reject, timer, method, threadId: params.threadId });
+      let onAbort;
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        if (options?.signal && onAbort) options.signal.removeEventListener('abort', onAbort);
+        if (method === 'turn/start') this.allowedTurns.delete(params.threadId);
+        reject(new Error(`Codex ${method} timed out`));
+      }, timeout);
+      if (options?.signal) {
+        onAbort = () => {
+          this.pending.delete(id);
+          clearTimeout(timer);
+          if (method === 'turn/start') this.allowedTurns.delete(params.threadId);
+          reject(new Error(`Codex ${method} aborted`));
+        };
+        options.signal.addEventListener('abort', onAbort, { once: true });
+      }
+      this.pending.set(id, { resolve, reject, timer, method, threadId: params.threadId, onAbort, signal: options?.signal });
       try { this.write({ id, method, params }); }
-      catch (error) { this.pending.delete(id); clearTimeout(timer); if (method === 'turn/start') this.allowedTurns.delete(params.threadId); reject(error); }
+      catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        if (options?.signal && onAbort) options.signal.removeEventListener('abort', onAbort);
+        if (method === 'turn/start') this.allowedTurns.delete(params.threadId);
+        reject(error);
+      }
     });
   }
-  async close() {
+  async close(timeoutMs) {
     if (this.closed) return;
     this.closing = true;
-    this.child.stdin.end();
+    try { this.child.stdin.end(); } catch {}
     let timer;
-    await Promise.race([this.exited, new Promise((resolve) => { timer = setTimeout(resolve, 2000); })]);
+    const gracefulMs = timeoutMs !== undefined
+      ? Math.min(2000, Math.max(10, Math.floor(timeoutMs * 0.4)))
+      : 2000;
+    const exitMs = timeoutMs !== undefined
+      ? Math.min(3000, Math.max(10, timeoutMs - gracefulMs))
+      : 3000;
+    await Promise.race([this.exited, new Promise((resolve) => { timer = setTimeout(resolve, gracefulMs); })]);
     clearTimeout(timer);
-    if (!this.closed) this.child.kill();
+    if (!this.closed) {
+      try { this.child.kill(); } catch {}
+    }
     await Promise.race([this.exited, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Could not confirm temporary Codex process cleanup')), 3000);
+      timer = setTimeout(() => reject(new Error('Could not confirm temporary Codex process cleanup')), exitMs);
     })]).finally(() => clearTimeout(timer));
-    this.lines.close();
+    this.lines?.close();
   }
 }
 
@@ -112,11 +149,47 @@ export async function openAppServer(env = process.env, protocolOptions = {}) {
     env: { ...env, MODELTRACE_PROBE_PROCESS: '1' },
   });
   const client = new AppServerClient(child, protocolOptions);
+  if (typeof protocolOptions.onClient === 'function') {
+    try { protocolOptions.onClient(client); } catch {}
+  }
+  const deadline = protocolOptions.deadline;
+  const rem = deadline ? deadline - Date.now() : 15000;
+  const initTimeout = protocolOptions.timeout !== undefined ? Math.min(protocolOptions.timeout, rem) : rem;
+  if (initTimeout <= 0) {
+    client.destroy(new Error('App-server initialization timed out (deadline exceeded)'));
+    try { await client.close(50); } catch {}
+    throw new Error('App-server initialization timed out (deadline exceeded)');
+  }
+  let onAbort;
+  if (protocolOptions.signal) {
+    if (protocolOptions.signal.aborted) {
+      client.destroy(new Error('App-server initialization aborted'));
+      try { await client.close(50); } catch {}
+      throw new Error('App-server initialization aborted');
+    }
+    onAbort = () => {
+      client.destroy(new Error('App-server initialization aborted'));
+    };
+    protocolOptions.signal.addEventListener('abort', onAbort, { once: true });
+  }
   try {
-    await client.request('initialize', { clientInfo: CODEX_CLIENT_INFO, capabilities: { experimentalApi: true } });
+    await client.request(
+      'initialize',
+      { clientInfo: CODEX_CLIENT_INFO, capabilities: { experimentalApi: true } },
+      initTimeout,
+      { signal: protocolOptions.signal }
+    );
     client.write({ method: 'initialized' });
     return client;
-  } catch (error) { await client.close(); throw error; }
+  } catch (error) {
+    client.destroy(error);
+    await client.close(100).catch(() => {});
+    throw error;
+  } finally {
+    if (protocolOptions.signal && onAbort) {
+      protocolOptions.signal.removeEventListener('abort', onAbort);
+    }
+  }
 }
 
 const CODEX_UUID_REGEX = /^(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -146,10 +219,13 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
   }
   const hookTimeoutMs = dependencies.hookTimeoutMs ?? dependencies.deadlineMs ?? dependencies.timeoutMs ?? Number(env?.MODELTRACE_HOOK_DEADLINE_MS || 4000);
   const deadline = dependencies.deadline ?? (Date.now() + hookTimeoutMs);
-  const connect = dependencies.connect || ((e) => openAppServer(e, { enforceAllowedTurns: false }));
+  const connect = dependencies.connect || ((e, opts) => openAppServer(e, { enforceAllowedTurns: false, ...opts }));
 
   let client;
+  let spawnedClient = null;
   let connectTimedOut = false;
+  const abortController = new AbortController();
+
   if (dependencies.client) {
     client = dependencies.client;
   } else {
@@ -159,12 +235,19 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
     }
     const reserveAfterConnect = Math.min(300, Math.max(60, Math.floor(remConnect * 0.3)));
     const connectBudget = remConnect - reserveAfterConnect;
-    const connectPromise = Promise.resolve().then(() => connect(env));
+    const connectOpts = {
+      deadline,
+      timeout: connectBudget,
+      signal: abortController.signal,
+      onClient: (c) => { spawnedClient = c; },
+    };
+    const connectPromise = Promise.resolve().then(() => connect(env, connectOpts));
     connectPromise.then(
       (c) => {
         if (connectTimedOut && c) {
-          try { c.close().catch(() => {}); } catch {}
+          try { c.destroy?.(); } catch {}
           try { c.child?.kill?.(); } catch {}
+          try { c.close?.().catch(() => {}); } catch {}
         }
       },
       () => {}
@@ -173,6 +256,12 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
       client = await withTimeout(() => connectPromise, connectBudget, 'App-server initialization');
     } catch (err) {
       connectTimedOut = true;
+      abortController.abort();
+      if (spawnedClient) {
+        try { spawnedClient.destroy?.(err); } catch {}
+        try { spawnedClient.child?.kill?.(); } catch {}
+        try { spawnedClient.close?.(100).catch(() => {}); } catch {}
+      }
       throw err;
     }
   }
@@ -185,7 +274,7 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
     const reserveAfterGet = Math.min(200, Math.max(40, Math.floor(remGet * 0.3)));
     const getBudget = remGet - reserveAfterGet;
     const getRes = await withTimeout(
-      () => client.request('thread/goal/get', { threadId: session }, getBudget),
+      () => client.request('thread/goal/get', { threadId: session }, getBudget, { signal: abortController.signal }),
       getBudget,
       'Codex thread/goal/get'
     );
@@ -201,7 +290,7 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
     const reserveAfterSet = Math.min(100, Math.max(20, Math.floor(remSet * 0.3)));
     const setBudget = remSet - reserveAfterSet;
     const setRes = await withTimeout(
-      () => client.request('thread/goal/set', { threadId: session, status: 'paused' }, setBudget),
+      () => client.request('thread/goal/set', { threadId: session, status: 'paused' }, setBudget, { signal: abortController.signal }),
       setBudget,
       'Codex thread/goal/set'
     );
@@ -209,18 +298,23 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
       throw new Error(`Host goal pause unconfirmed: status is ${setRes?.goal?.status || 'unknown'}`);
     }
     return { hasGoal: true, paused: true, previousStatus: currentGoal.status, goal: setRes.goal };
+  } catch (err) {
+    abortController.abort();
+    throw err;
   } finally {
     if (!dependencies.client && client) {
       const remClose = deadline - Date.now() - 20;
       const closeBudget = Math.max(20, Math.min(200, remClose));
       try {
         if (remClose <= 0) {
+          try { client.destroy?.(); } catch {}
           try { client.child?.kill?.(); } catch {}
-          client.close().catch(() => {});
+          client.close?.(50).catch(() => {});
         } else {
-          await withTimeout(() => client.close(), closeBudget, 'App-server client cleanup');
+          await withTimeout(() => client.close(closeBudget), closeBudget, 'App-server client cleanup');
         }
       } catch {
+        try { client.destroy?.(); } catch {}
         try { client.child?.kill?.(); } catch {}
       }
     }
@@ -234,10 +328,13 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
   }
   const hookTimeoutMs = dependencies.hookTimeoutMs ?? dependencies.deadlineMs ?? dependencies.timeoutMs ?? Number(env?.MODELTRACE_HOOK_DEADLINE_MS || 4000);
   const deadline = dependencies.deadline ?? (Date.now() + hookTimeoutMs);
-  const connect = dependencies.connect || ((e) => openAppServer(e, { enforceAllowedTurns: false }));
+  const connect = dependencies.connect || ((e, opts) => openAppServer(e, { enforceAllowedTurns: false, ...opts }));
 
   let client;
+  let spawnedClient = null;
   let connectTimedOut = false;
+  const abortController = new AbortController();
+
   if (dependencies.client) {
     client = dependencies.client;
   } else {
@@ -247,12 +344,19 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
     }
     const reserveAfterConnect = Math.min(300, Math.max(60, Math.floor(remConnect * 0.3)));
     const connectBudget = remConnect - reserveAfterConnect;
-    const connectPromise = Promise.resolve().then(() => connect(env));
+    const connectOpts = {
+      deadline,
+      timeout: connectBudget,
+      signal: abortController.signal,
+      onClient: (c) => { spawnedClient = c; },
+    };
+    const connectPromise = Promise.resolve().then(() => connect(env, connectOpts));
     connectPromise.then(
       (c) => {
         if (connectTimedOut && c) {
-          try { c.close().catch(() => {}); } catch {}
+          try { c.destroy?.(); } catch {}
           try { c.child?.kill?.(); } catch {}
+          try { c.close?.().catch(() => {}); } catch {}
         }
       },
       () => {}
@@ -261,6 +365,12 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
       client = await withTimeout(() => connectPromise, connectBudget, 'App-server initialization');
     } catch (err) {
       connectTimedOut = true;
+      abortController.abort();
+      if (spawnedClient) {
+        try { spawnedClient.destroy?.(err); } catch {}
+        try { spawnedClient.child?.kill?.(); } catch {}
+        try { spawnedClient.close?.(100).catch(() => {}); } catch {}
+      }
       throw err;
     }
   }
@@ -273,7 +383,7 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
     const reserveAfterGet = Math.min(200, Math.max(40, Math.floor(remGet * 0.3)));
     const getBudget = remGet - reserveAfterGet;
     const getRes = await withTimeout(
-      () => client.request('thread/goal/get', { threadId: session }, getBudget),
+      () => client.request('thread/goal/get', { threadId: session }, getBudget, { signal: abortController.signal }),
       getBudget,
       'Codex thread/goal/get'
     );
@@ -291,7 +401,7 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
     const reserveAfterSet = Math.min(100, Math.max(20, Math.floor(remSet * 0.3)));
     const setBudget = remSet - reserveAfterSet;
     const setRes = await withTimeout(
-      () => client.request('thread/goal/set', { threadId: session, status: 'active' }, setBudget),
+      () => client.request('thread/goal/set', { threadId: session, status: 'active' }, setBudget, { signal: abortController.signal }),
       setBudget,
       'Codex thread/goal/set'
     );
@@ -299,18 +409,23 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
       throw new Error(`Host goal resume unconfirmed: status is ${setRes?.goal?.status || 'unknown'}`);
     }
     return { hasGoal: true, resumed: true, goal: setRes.goal };
+  } catch (err) {
+    abortController.abort();
+    throw err;
   } finally {
     if (!dependencies.client && client) {
       const remClose = deadline - Date.now() - 20;
       const closeBudget = Math.max(20, Math.min(200, remClose));
       try {
         if (remClose <= 0) {
+          try { client.destroy?.(); } catch {}
           try { client.child?.kill?.(); } catch {}
-          client.close().catch(() => {});
+          client.close?.(50).catch(() => {});
         } else {
-          await withTimeout(() => client.close(), closeBudget, 'App-server client cleanup');
+          await withTimeout(() => client.close(closeBudget), closeBudget, 'App-server client cleanup');
         }
       } catch {
+        try { client.destroy?.(); } catch {}
         try { client.child?.kill?.(); } catch {}
       }
     }

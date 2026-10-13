@@ -180,27 +180,41 @@ export async function runQueryWithNodeSqlite(dbPath, sql, { timeout = 2000 } = {
 
 export async function runQuery(dbPath, sql, options = {}) {
   if (typeof options.execFn === 'function') return options.execFn(dbPath, sql, options);
+  const now = Date.now();
+  const deadline = options.deadline ?? (options.timeout !== undefined ? now + options.timeout : now + 2000);
+  const remainingTotal = deadline - now;
+  if (remainingTotal <= 10) {
+    throw new Error('SQLite query timed out (budget exhausted)');
+  }
+  const cliTimeout = Math.min(options.timeout ?? 2000, Math.max(10, remainingTotal));
   try {
-    return await runQueryWithCli(dbPath, sql, options);
+    return await runQueryWithCli(dbPath, sql, { ...options, timeout: cliTimeout });
   } catch (cliErr) {
+    const remFallback = deadline - Date.now();
+    if (remFallback <= 10) {
+      throw cliErr;
+    }
     try {
-      return await runQueryWithNodeSqlite(dbPath, sql, options);
+      const fallbackTimeout = Math.min(options.timeout ?? 2000, remFallback);
+      return await runQueryWithNodeSqlite(dbPath, sql, { ...options, timeout: fallbackTimeout });
     } catch {
       throw cliErr;
     }
   }
 }
 
-export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = process.env, execFn, allowGlobalFallback = false, timeout } = {}) {
+export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = process.env, execFn, allowGlobalFallback = false, timeout, deadline } = {}) {
   const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
   if (!existsSync(targetDb)) return null;
+
+  const resolvedDeadline = deadline ?? (timeout !== undefined ? Date.now() + timeout : undefined);
 
   const sessionIds = Array.from(new Set((Array.isArray(sessionId) ? sessionId : [sessionId]).filter((id) => typeof id === 'string' && id.trim().length > 0)));
   if (sessionIds.length > 0) {
     const list = sessionIds.map((id) => `'${String(id).replace(/'/g, "''")}'`).join(', ');
     const clause = sessionIds.length === 1 ? `thread_id = ${list}` : `thread_id IN (${list})`;
     const sql = `SELECT id, ts, feedback_log_body FROM logs WHERE ${clause} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1;`;
-    const rows = await runQuery(targetDb, sql, { execFn, timeout });
+    const rows = await runQuery(targetDb, sql, { execFn, timeout, deadline: resolvedDeadline });
     if (Array.isArray(rows) && rows.length > 0) return rows[0];
     if (!allowGlobalFallback) return null;
   }
@@ -208,22 +222,24 @@ export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = 
   if (!allowGlobalFallback) return null;
 
   const sql = `SELECT id, ts, feedback_log_body FROM logs WHERE target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY id DESC LIMIT 1;`;
-  const rows = await runQuery(targetDb, sql, { execFn, timeout });
+  const rows = await runQuery(targetDb, sql, { execFn, timeout, deadline: resolvedDeadline });
   if (Array.isArray(rows) && rows.length > 0) return rows[0];
   return null;
 }
 
-export async function queryLatestRecordsPerSession({ dbPath, sessionIds = [], env = process.env, execFn, timeout } = {}) {
+export async function queryLatestRecordsPerSession({ dbPath, sessionIds = [], env = process.env, execFn, timeout, deadline } = {}) {
   const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
   if (!existsSync(targetDb)) return [];
 
   const uniqueIds = Array.from(new Set(sessionIds.filter((id) => typeof id === 'string' && id.trim().length > 0)));
   if (!uniqueIds.length) return [];
 
+  const resolvedDeadline = deadline ?? (timeout !== undefined ? Date.now() + timeout : undefined);
+
   if (uniqueIds.length === 1) {
     const escaped = `'${String(uniqueIds[0]).replace(/'/g, "''")}'`;
     const sql = `SELECT id, ts, feedback_log_body, thread_id FROM logs WHERE thread_id = ${escaped} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1;`;
-    const rows = await runQuery(targetDb, sql, { execFn, timeout });
+    const rows = await runQuery(targetDb, sql, { execFn, timeout, deadline: resolvedDeadline });
     return Array.isArray(rows) ? rows : [];
   }
 
@@ -232,17 +248,21 @@ export async function queryLatestRecordsPerSession({ dbPath, sessionIds = [], en
     return `SELECT id, ts, feedback_log_body, thread_id FROM logs WHERE thread_id = ${escaped} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1`;
   });
   const sql = subqueries.map((q) => `SELECT * FROM (${q})`).join(' UNION ALL ') + ';';
-  const rows = await runQuery(targetDb, sql, { execFn, timeout });
+  const rows = await runQuery(targetDb, sql, { execFn, timeout, deadline: resolvedDeadline });
   return Array.isArray(rows) ? rows : [];
 }
 
-export async function checkSqliteSessions({ dbPath, sessions = [], env = process.env, execFn, timeout } = {}) {
+export async function checkSqliteSessions({ dbPath, sessions = [], env = process.env, execFn, timeout, deadline } = {}) {
   try {
     const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
     if (!existsSync(targetDb)) return { checked: false, reason: 'database_not_found', results: [] };
     const sessionIds = sessions.map((s) => s.sessionId).filter(Boolean);
     if (!sessionIds.length) return { checked: true, results: [] };
-    const rows = await queryLatestRecordsPerSession({ dbPath: targetDb, sessionIds, env, execFn, timeout });
+    const resolvedDeadline = deadline ?? (timeout !== undefined ? Date.now() + timeout : undefined);
+    if (resolvedDeadline && Date.now() >= resolvedDeadline) {
+      return { checked: false, error: 'SQLite query deadline exceeded (budget exhausted)', results: [] };
+    }
+    const rows = await queryLatestRecordsPerSession({ dbPath: targetDb, sessionIds, env, execFn, timeout, deadline: resolvedDeadline });
     const results = [];
     for (const sessConfig of sessions) {
       const row = rows.find((r) => {
@@ -272,11 +292,15 @@ export async function checkSqliteSessions({ dbPath, sessions = [], env = process
   }
 }
 
-export async function checkSqliteLatest({ dbPath, sessionId, expectedModel, lastLogId = null, env = process.env, execFn, allowGlobalFallback = false, timeout } = {}) {
+export async function checkSqliteLatest({ dbPath, sessionId, expectedModel, lastLogId = null, env = process.env, execFn, allowGlobalFallback = false, timeout, deadline } = {}) {
   try {
     const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
     if (!existsSync(targetDb)) return { checked: false, reason: 'database_not_found', degraded: false };
-    const row = await queryLatestRecord({ dbPath: targetDb, sessionId, env, execFn, allowGlobalFallback, timeout });
+    const resolvedDeadline = deadline ?? (timeout !== undefined ? Date.now() + timeout : undefined);
+    if (resolvedDeadline && Date.now() >= resolvedDeadline) {
+      return { checked: false, error: 'SQLite query deadline exceeded (budget exhausted)', degraded: false };
+    }
+    const row = await queryLatestRecord({ dbPath: targetDb, sessionId, env, execFn, allowGlobalFallback, timeout, deadline: resolvedDeadline });
     if (!row) return { checked: true, record: null, degraded: false };
     if (lastLogId !== null && lastLogId !== undefined && row.id <= lastLogId) {
       return { checked: true, record: null, alreadySeen: true, degraded: false };

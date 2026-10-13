@@ -333,14 +333,24 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
           lastLogId: logIds[sid] ?? null,
         }));
         const remSqlite = deadline - Date.now() - 1000;
-        const sqliteTimeout = Math.max(50, Math.min(2000, remSqlite));
-        const telemetryBatch = await checkSqliteSessions({ sessions: sessionsConfig, env, timeout: sqliteTimeout });
-        if (!telemetryBatch.checked) {
-          const errDetail = telemetryBatch.error || telemetryBatch.reason || 'unknown_error';
-          record(state, 'telemetry_coverage_gap', now, { error: errDetail });
-          state.lastTelemetryGap = { at: now, error: errDetail };
+        if (remSqlite <= 0) {
+          record(state, 'telemetry_coverage_gap', now, { error: 'SQLite query deadline exceeded (budget exhausted)' });
+          state.lastTelemetryGap = { at: now, error: 'SQLite query deadline exceeded (budget exhausted)' };
         } else {
-          state.lastTelemetryGap = null;
+          const sqliteTimeout = Math.max(50, Math.min(2000, remSqlite));
+          const sqliteDeadline = Date.now() + sqliteTimeout;
+          const telemetryBatch = await checkSqliteSessions({
+            sessions: sessionsConfig,
+            env,
+            timeout: sqliteTimeout,
+            deadline: sqliteDeadline,
+          });
+          if (!telemetryBatch.checked) {
+            const errDetail = telemetryBatch.error || telemetryBatch.reason || 'unknown_error';
+            record(state, 'telemetry_coverage_gap', now, { error: errDetail });
+            state.lastTelemetryGap = { at: now, error: errDetail };
+          } else {
+            state.lastTelemetryGap = null;
           for (const res of telemetryBatch.results) {
             if (!res.record) continue;
             if (!state.lastSqliteLogIds) state.lastSqliteLogIds = {};
@@ -447,6 +457,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
               }
             }
           }
+        }
         }
       } catch (err) {
         record(state, 'telemetry_coverage_gap', now, { error: err.message });

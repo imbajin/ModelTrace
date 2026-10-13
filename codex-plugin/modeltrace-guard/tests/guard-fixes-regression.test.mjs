@@ -1,14 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, open, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { handleHook, ROOT } from '../scripts/guard.mjs';
 import { handleBackgroundHook } from '../scripts/background.mjs';
 import { withState, readState, sessionPath } from '../scripts/state.mjs';
 import { pendingAlerts } from '../scripts/alerts.mjs';
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code !== 'ESRCH';
+  }
+}
 
 async function tempDir(t) {
   const dir = await mkdtemp(path.join(tmpdir(), 'modeltrace-regression-test-'));
@@ -1090,4 +1099,167 @@ test('slow SQLite queries respect the hook deadline budget without exceeding tot
   const state = await readState(dataDir, sessionId);
   assert.ok(state.lastTelemetryGap !== undefined);
 });
+
+test('real hook CLI regression: slow app-server initialization cancels request, cleans up child process, and exits promptly', { timeout: 15000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'data');
+  const pidFile = path.join(dir, 'slow-codex.pid');
+  const slowScript = path.join(dir, 'slow-codex.mjs');
+
+  const scriptContent = `#!/usr/bin/env node
+import fs from 'node:fs';
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+process.stdin.resume();
+`;
+  await writeFile(slowScript, scriptContent, { mode: 0o755 });
+  await chmod(slowScript, 0o755);
+
+  const sessionId = '00000000-0000-0000-0000-000000000010';
+  await withState(dataDir, sessionId, (s) => {
+    s.enabled = true;
+    s.turn = 'turn-slow-cli';
+    s.taskHalt = {
+      id: 'telemetry-halt-slow-cli',
+      at: 1000,
+      source: 'telemetry',
+      attempt: 3,
+      maxAttempts: 3,
+      exhausted: true,
+      reason: 'Safety Buffering',
+    };
+  });
+
+  const hookInput = {
+    session_id: sessionId,
+    hook_event_name: 'Stop',
+    turn_id: 'turn-slow-cli',
+  };
+
+  const start = performance.now();
+  const hookProc = spawn(process.execPath, [path.join(ROOT, 'scripts', 'guard.mjs'), 'hook', '--data-dir', dataDir], {
+    env: {
+      ...process.env,
+      MODELTRACE_CODEX_PATH: slowScript,
+      MODELTRACE_HOOK_DEADLINE_MS: '1500',
+    },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+
+  let jsonOutputTime = null;
+  let stdoutData = '';
+
+  hookProc.stdout.on('data', (chunk) => {
+    if (jsonOutputTime === null) {
+      jsonOutputTime = performance.now() - start;
+    }
+    stdoutData += chunk;
+  });
+
+  hookProc.stdin.end(JSON.stringify(hookInput));
+
+  const exitCode = await new Promise((resolve) => {
+    hookProc.on('exit', (code) => resolve(code));
+  });
+  const processExitTime = performance.now() - start;
+
+  assert.equal(exitCode, 0, 'Hook CLI process must exit with code 0');
+  assert.ok(jsonOutputTime !== null, 'Hook CLI must output JSON to stdout');
+  assert.ok(jsonOutputTime < 3000, `JSON output time (${jsonOutputTime}ms) must be well within deadline`);
+  assert.ok(processExitTime < 4000, `Actual process exit time (${processExitTime}ms) must be well within deadline`);
+
+  const output = JSON.parse(stdoutData.trim());
+  assert.equal(output.continue, false, 'Must command continue: false');
+
+  // Verify child process was cleaned up and is not lingering
+  const slowPid = Number((await readFile(pidFile, 'utf8')).trim());
+  assert.ok(!isNaN(slowPid) && slowPid > 0, 'Slow codex child process PID must be recorded');
+
+  // Wait a brief moment to allow signal delivery and reaping
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(isProcessAlive(slowPid), false, 'Temporary app-server process must be terminated and not linger');
+});
+
+test('real hook CLI regression: real SQLite BEGIN EXCLUSIVE lock stacked with state lock contention reports coverage gap within deadline', { timeout: 15000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'data');
+  const dbFile = path.join(dir, 'exclusive_logs.sqlite');
+  initTestDb(dbFile);
+
+  const { DatabaseSync } = await import('node:sqlite');
+  const lockerDb = new DatabaseSync(dbFile);
+  lockerDb.exec('BEGIN EXCLUSIVE;');
+  t.after(() => {
+    try { lockerDb.exec('ROLLBACK;'); } catch {}
+    try { lockerDb.close(); } catch {}
+  });
+
+  const sessionId = '00000000-0000-0000-0000-000000000020';
+  await withState(dataDir, sessionId, (s) => {
+    s.enabled = true;
+    s.turn = 'turn-exclusive-combo';
+  });
+
+  // Hold a state lock for 600ms to simulate state lock wait contention
+  const lockFile = sessionPath(dataDir, sessionId) + '.lock';
+  const lockHandle = await open(lockFile, 'wx', 0o600);
+  await lockHandle.writeFile(JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
+  await lockHandle.sync();
+
+  setTimeout(async () => {
+    try {
+      await lockHandle.close();
+      await unlink(lockFile);
+    } catch {}
+  }, 600);
+
+  const hookInput = {
+    session_id: sessionId,
+    hook_event_name: 'PreToolUse',
+    turn_id: 'turn-exclusive-combo',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo test' },
+  };
+
+  const start = performance.now();
+  const hookProc = spawn(process.execPath, [path.join(ROOT, 'scripts', 'guard.mjs'), 'hook', '--data-dir', dataDir], {
+    env: {
+      ...process.env,
+      CODEX_LOGS_DB: dbFile,
+      MODELTRACE_HOOK_DEADLINE_MS: '4000',
+    },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+
+  let jsonOutputTime = null;
+  let stdoutData = '';
+
+  hookProc.stdout.on('data', (chunk) => {
+    if (jsonOutputTime === null) {
+      jsonOutputTime = performance.now() - start;
+    }
+    stdoutData += chunk;
+  });
+
+  hookProc.stdin.end(JSON.stringify(hookInput));
+
+  const exitCode = await new Promise((resolve) => {
+    hookProc.on('exit', (code) => resolve(code));
+  });
+  const processExitTime = performance.now() - start;
+
+  assert.equal(exitCode, 0, 'Hook CLI process must exit with code 0');
+  assert.ok(jsonOutputTime !== null, 'Hook CLI must output JSON to stdout');
+  assert.ok(jsonOutputTime < 4500, `JSON output time (${jsonOutputTime}ms) must stay under 5-second host limit`);
+  assert.ok(processExitTime < 4800, `Process exit time (${processExitTime}ms) must stay under 5-second host limit`);
+
+  const output = JSON.parse(stdoutData.trim());
+  assert.ok(
+    output.systemMessage?.includes('本地 SQLite 遥测检查失败') || output.systemMessage?.includes('覆盖存在缺口'),
+    'Output must report telemetry coverage gap'
+  );
+
+  const state = await readState(dataDir, sessionId);
+  assert.ok(state.lastTelemetryGap !== null && state.lastTelemetryGap !== undefined, 'State must record telemetry coverage gap');
+});
+
 
