@@ -150,8 +150,9 @@ export function analyzeRecord(record, { expectedModel } = {}) {
 
 export async function runQueryWithCli(dbPath, sql, { timeout = 2000 } = {}) {
   const resolved = path.resolve(dbPath);
+  const cliTimeout = Math.min(2000, Math.max(50, timeout));
   return new Promise((resolve, reject) => {
-    execFile('sqlite3', ['-cmd', '.timeout 2000', '-json', `file:${resolved}?mode=ro`, sql], { timeout, encoding: 'utf8' }, (error, stdout) => {
+    execFile('sqlite3', ['-cmd', `.timeout ${cliTimeout}`, '-json', `file:${resolved}?mode=ro`, sql], { timeout: cliTimeout, encoding: 'utf8' }, (error, stdout) => {
       if (error) return reject(error);
       const trimmed = (stdout || '').trim();
       if (!trimmed) return resolve([]);
@@ -164,12 +165,12 @@ export async function runQueryWithCli(dbPath, sql, { timeout = 2000 } = {}) {
   });
 }
 
-export async function runQueryWithNodeSqlite(dbPath, sql) {
+export async function runQueryWithNodeSqlite(dbPath, sql, { timeout = 2000 } = {}) {
   const { DatabaseSync } = await import('node:sqlite');
   const resolved = path.resolve(dbPath);
   const db = new DatabaseSync(resolved, { readOnly: true });
   try {
-    db.exec('PRAGMA busy_timeout = 2000;');
+    db.exec(`PRAGMA busy_timeout = ${Math.min(2000, Math.max(50, timeout))};`);
     const rows = db.prepare(sql).all();
     return rows || [];
   } finally {
@@ -183,14 +184,14 @@ export async function runQuery(dbPath, sql, options = {}) {
     return await runQueryWithCli(dbPath, sql, options);
   } catch (cliErr) {
     try {
-      return await runQueryWithNodeSqlite(dbPath, sql);
+      return await runQueryWithNodeSqlite(dbPath, sql, options);
     } catch {
       throw cliErr;
     }
   }
 }
 
-export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = process.env, execFn, allowGlobalFallback = false } = {}) {
+export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = process.env, execFn, allowGlobalFallback = false, timeout } = {}) {
   const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
   if (!existsSync(targetDb)) return null;
 
@@ -199,7 +200,7 @@ export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = 
     const list = sessionIds.map((id) => `'${String(id).replace(/'/g, "''")}'`).join(', ');
     const clause = sessionIds.length === 1 ? `thread_id = ${list}` : `thread_id IN (${list})`;
     const sql = `SELECT id, ts, feedback_log_body FROM logs WHERE ${clause} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1;`;
-    const rows = await runQuery(targetDb, sql, { execFn });
+    const rows = await runQuery(targetDb, sql, { execFn, timeout });
     if (Array.isArray(rows) && rows.length > 0) return rows[0];
     if (!allowGlobalFallback) return null;
   }
@@ -207,12 +208,12 @@ export async function queryLatestRecord({ dbPath, sessionId, limit = 500, env = 
   if (!allowGlobalFallback) return null;
 
   const sql = `SELECT id, ts, feedback_log_body FROM logs WHERE target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY id DESC LIMIT 1;`;
-  const rows = await runQuery(targetDb, sql, { execFn });
+  const rows = await runQuery(targetDb, sql, { execFn, timeout });
   if (Array.isArray(rows) && rows.length > 0) return rows[0];
   return null;
 }
 
-export async function queryLatestRecordsPerSession({ dbPath, sessionIds = [], env = process.env, execFn } = {}) {
+export async function queryLatestRecordsPerSession({ dbPath, sessionIds = [], env = process.env, execFn, timeout } = {}) {
   const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
   if (!existsSync(targetDb)) return [];
 
@@ -222,7 +223,7 @@ export async function queryLatestRecordsPerSession({ dbPath, sessionIds = [], en
   if (uniqueIds.length === 1) {
     const escaped = `'${String(uniqueIds[0]).replace(/'/g, "''")}'`;
     const sql = `SELECT id, ts, feedback_log_body, thread_id FROM logs WHERE thread_id = ${escaped} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1;`;
-    const rows = await runQuery(targetDb, sql, { execFn });
+    const rows = await runQuery(targetDb, sql, { execFn, timeout });
     return Array.isArray(rows) ? rows : [];
   }
 
@@ -231,17 +232,17 @@ export async function queryLatestRecordsPerSession({ dbPath, sessionIds = [], en
     return `SELECT id, ts, feedback_log_body, thread_id FROM logs WHERE thread_id = ${escaped} AND target = 'codex_http_client::client' AND feedback_log_body LIKE '%/responses%' ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1`;
   });
   const sql = subqueries.map((q) => `SELECT * FROM (${q})`).join(' UNION ALL ') + ';';
-  const rows = await runQuery(targetDb, sql, { execFn });
+  const rows = await runQuery(targetDb, sql, { execFn, timeout });
   return Array.isArray(rows) ? rows : [];
 }
 
-export async function checkSqliteSessions({ dbPath, sessions = [], env = process.env, execFn } = {}) {
+export async function checkSqliteSessions({ dbPath, sessions = [], env = process.env, execFn, timeout } = {}) {
   try {
     const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
     if (!existsSync(targetDb)) return { checked: false, reason: 'database_not_found', results: [] };
     const sessionIds = sessions.map((s) => s.sessionId).filter(Boolean);
     if (!sessionIds.length) return { checked: true, results: [] };
-    const rows = await queryLatestRecordsPerSession({ dbPath: targetDb, sessionIds, env, execFn });
+    const rows = await queryLatestRecordsPerSession({ dbPath: targetDb, sessionIds, env, execFn, timeout });
     const results = [];
     for (const sessConfig of sessions) {
       const row = rows.find((r) => {
@@ -271,11 +272,11 @@ export async function checkSqliteSessions({ dbPath, sessions = [], env = process
   }
 }
 
-export async function checkSqliteLatest({ dbPath, sessionId, expectedModel, lastLogId = null, env = process.env, execFn, allowGlobalFallback = false } = {}) {
+export async function checkSqliteLatest({ dbPath, sessionId, expectedModel, lastLogId = null, env = process.env, execFn, allowGlobalFallback = false, timeout } = {}) {
   try {
     const targetDb = path.resolve(dbPath || getDefaultDbPath(env));
     if (!existsSync(targetDb)) return { checked: false, reason: 'database_not_found', degraded: false };
-    const row = await queryLatestRecord({ dbPath: targetDb, sessionId, env, execFn, allowGlobalFallback });
+    const row = await queryLatestRecord({ dbPath: targetDb, sessionId, env, execFn, allowGlobalFallback, timeout });
     if (!row) return { checked: true, record: null, degraded: false };
     if (lastLogId !== null && lastLogId !== undefined && row.id <= lastLogId) {
       return { checked: true, record: null, alreadySeen: true, degraded: false };

@@ -13,7 +13,7 @@ import { pauseThreadGoal, resumeThreadGoal } from './app-server-client.mjs';
 import {
   DEFAULTS, WARNING, abandon, classifySample, dataDirectory, digest, expirePending, getEnvConfig, issue,
   readState, recentComparable, record, schedule, segment, setTaskName, setTurn, validateConfig, validateNumbers, withState, workspaceName,
-  interruptConfirmation, updateConfirmation, processAlive, BACKGROUND_STATE_LOCK,
+  interruptConfirmation, updateConfirmation, processAlive, BACKGROUND_STATE_LOCK, STATE_LOCK_TIMEOUT_MS,
 } from './state.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -123,9 +123,6 @@ export function isControlCommand(event, isHalted = false) {
 }
 
 function preToolDecision(event, state, directory, now = Date.now()) {
-  if (state?.taskHalt?.source === 'telemetry' && state.taskHalt.pausedUntil && now >= state.taskHalt.pausedUntil && !state.taskHalt.exhausted && !state.taskHalt.canaryActive && !state.lastTelemetryGap) {
-    return {};
-  }
   const isHalted = Boolean(state?.taskHalt);
   const reason = state ? notificationContext(state, directory, undefined, now) || controlContext(state, directory, now) : null;
   if (reason && !isControlCommand(event, isHalted)) return { systemMessage: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
@@ -159,9 +156,15 @@ async function busyHookFallback(event, directory, error, now = Date.now(), { dep
     let hostNote = '';
     let hostWarning = '';
     if (!state.taskHalt.goalPaused && !state.taskHalt.hostConfirmed) {
+      const deadline = dependencies.deadline ?? (Date.now() + (dependencies.hookTimeoutMs ?? dependencies.timeoutMs ?? 4000));
       try {
-        const pauseRes = await pauseThreadGoal(targetSession, env, { ...dependencies, timeoutMs: dependencies.timeoutMs || 2500 });
+        const pauseRes = await pauseThreadGoal(targetSession, env, {
+          ...dependencies,
+          deadline,
+          timeoutMs: Math.max(50, deadline - Date.now() - 100),
+        });
         hostNote = pauseRes.hasGoal ? ' (host active goal paused)' : ' (no active host goal)';
+        const remStateBudget = Math.max(10, Math.min(50, deadline - Date.now()));
         await withState(directory, targetSession, (s) => {
           if (s.taskHalt && s.taskHalt.id === state.taskHalt.id) {
             s.taskHalt.goalPaused = Boolean(pauseRes.paused);
@@ -175,9 +178,10 @@ async function busyHookFallback(event, directory, error, now = Date.now(), { dep
             }
             record(s, 'host_goal_paused', Date.now(), { halt: s.taskHalt.id, session: s.session, hasGoal: pauseRes.hasGoal });
           }
-        }, { lockTimeoutMs: 50 }).catch(() => {});
+        }, { lockTimeoutMs: remStateBudget }).catch(() => {});
       } catch (err) {
         hostWarning = ` CRITICAL HOST GOAL WARNING: Automatic goal pause failed (${err.message}). The active goal may continue scheduling turns unless manually stopped or paused by user.`;
+        const remStateBudget = Math.max(10, Math.min(50, deadline - Date.now()));
         await withState(directory, targetSession, (s) => {
           if (s.taskHalt && s.taskHalt.id === state.taskHalt.id) {
             s.taskHalt.goalPaused = false;
@@ -189,7 +193,7 @@ async function busyHookFallback(event, directory, error, now = Date.now(), { dep
             }
             record(s, 'host_goal_pause_failed', Date.now(), { halt: s.taskHalt.id, session: s.session, error: err.message });
           }
-        }, { lockTimeoutMs: 50 }).catch(() => {});
+        }, { lockTimeoutMs: remStateBudget }).catch(() => {});
       }
     }
     const control = controlContext(state, directory, now);
@@ -226,6 +230,38 @@ async function busyHookFallback(event, directory, error, now = Date.now(), { dep
   return { systemMessage: notice, ...(continueOnce ? { decision: 'block', reason: notificationContext(state, directory) || control } : {}) };
 }
 
+export function migrateLegacySqliteCursor(state, targetSession) {
+  if (state.lastSqliteLogIds && typeof state.lastSqliteLogIds === 'object') {
+    return state.lastSqliteLogIds;
+  }
+  const migrated = {};
+  const legacyId = state.lastSqliteLogId;
+  if (typeof legacyId === 'number' && legacyId > 0) {
+    let confirmedSession = null;
+    if (state.lastTelemetry && state.lastTelemetry.logId === legacyId && state.lastTelemetry.sessionId) {
+      confirmedSession = state.lastTelemetry.sessionId;
+    } else if (state.taskHalt?.id === `telemetry-halt-${legacyId}`) {
+      confirmedSession = state.taskHalt.degradedSession || state.taskHalt.sessionId || state.degradedSession || null;
+    } else if (Array.isArray(state.events)) {
+      for (let i = state.events.length - 1; i >= 0; i--) {
+        const ev = state.events[i];
+        if (ev && (ev.logId === legacyId || ev.details?.logId === legacyId)) {
+          const sid = ev.sessionId || ev.details?.sessionId || ev.degradedSession || ev.details?.degradedSession;
+          if (sid) {
+            confirmedSession = sid;
+            break;
+          }
+        }
+      }
+    }
+    if (confirmedSession) {
+      migrated[confirmedSession] = legacyId;
+    }
+  }
+  state.lastSqliteLogIds = migrated;
+  return migrated;
+}
+
 export async function handleHook(event, directory, now = Date.now(), draw = randomInt, { background = false, dependencies = {}, env = process.env } = {}) {
   if (!event || typeof event.session_id !== 'string' || !event.session_id || event.session_id.length > 256) throw new Error('Missing or invalid session_id in hook input');
   const isSubagent = Boolean(event.agent_id || event.parent_session_id);
@@ -234,7 +270,10 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     || event.session_id;
   const supported = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PreCompact', 'Stop', 'Interrupt', 'SessionEnd'];
   if (!supported.includes(event.hook_event_name)) return {};
+  const hookTimeoutMs = dependencies.hookTimeoutMs ?? dependencies.deadlineMs ?? (dependencies.timeoutMs !== undefined && dependencies.timeoutMs <= 5000 ? dependencies.timeoutMs : Number(env.MODELTRACE_HOOK_DEADLINE_MS || 4000));
+  const deadline = dependencies.deadline ?? (Date.now() + hookTimeoutMs);
   let haltNeedsPause = false, haltId = null;
+  const lockWaitBudget = Math.min(STATE_LOCK_TIMEOUT_MS, Math.max(50, deadline - Date.now() - 1500));
   const hookOutput = await withState(directory, targetSession, async (state) => {
     const hook = event.hook_event_name;
     state.lastHookAt = now;
@@ -287,21 +326,19 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
           ...(state.subagentSessionIds || []),
           isSubagent ? event.session_id : null,
         ].filter(Boolean)));
+        const logIds = migrateLegacySqliteCursor(state, targetSession);
         const sessionsConfig = trackedSessions.map((sid) => ({
           sessionId: sid,
           expectedModel: sid === targetSession ? (state.expected || state.model) : (state.subagentModels?.[sid] || null),
-          lastLogId: state.lastSqliteLogIds
-            ? (state.lastSqliteLogIds[sid] ?? null)
-            : (sid === targetSession ? state.lastSqliteLogId : null),
+          lastLogId: logIds[sid] ?? null,
         }));
-        const telemetryBatch = await checkSqliteSessions({ sessions: sessionsConfig, env });
+        const remSqlite = deadline - Date.now() - 1000;
+        const sqliteTimeout = Math.max(50, Math.min(2000, remSqlite));
+        const telemetryBatch = await checkSqliteSessions({ sessions: sessionsConfig, env, timeout: sqliteTimeout });
         if (!telemetryBatch.checked) {
           const errDetail = telemetryBatch.error || telemetryBatch.reason || 'unknown_error';
           record(state, 'telemetry_coverage_gap', now, { error: errDetail });
           state.lastTelemetryGap = { at: now, error: errDetail };
-          if (state.taskHalt) {
-            state.taskHalt.canaryActive = false;
-          }
         } else {
           state.lastTelemetryGap = null;
           for (const res of telemetryBatch.results) {
@@ -383,7 +420,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
                 });
               }
             } else {
-              const degradedSession = state.degradedSession || targetSession;
+              const degradedSession = state.degradedSession || state.taskHalt?.degradedSession || targetSession;
               const isDegradedSession = degradedSession === res.sessionId;
               if (state.taskHalt?.source === 'telemetry' && !state.taskHalt.exhausted && state.taskHalt.canaryActive) {
                 if (isDegradedSession) {
@@ -414,9 +451,6 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
       } catch (err) {
         record(state, 'telemetry_coverage_gap', now, { error: err.message });
         state.lastTelemetryGap = { at: now, error: err.message };
-        if (state.taskHalt) {
-          state.taskHalt.canaryActive = false;
-        }
       }
     }
     const turnKey = state.turn || 'no-turn';
@@ -543,10 +577,15 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
     if (expired) return deliver({ systemMessage: 'ModelTrace Guard: a background checkpoint expired. Coverage gap recorded; work may continue.' });
     if (!isSubagent) issue(state, now, draw);
     return deliver({}, hook === 'SessionStart');
-  }, background ? BACKGROUND_STATE_LOCK : undefined).catch((error) => busyHookFallback(event, directory, error, now, { dependencies, env }));
+  }, background ? BACKGROUND_STATE_LOCK : { lockTimeoutMs: lockWaitBudget }).catch((error) => busyHookFallback(event, directory, error, now, { dependencies: { ...dependencies, deadline }, env }));
   if (haltNeedsPause && haltId) {
     try {
-      const pauseRes = await pauseThreadGoal(targetSession, env, { ...dependencies, timeoutMs: dependencies.timeoutMs || 2500 });
+      const pauseRes = await pauseThreadGoal(targetSession, env, {
+        ...dependencies,
+        deadline,
+        timeoutMs: Math.max(50, deadline - Date.now() - 100),
+      });
+      const remStateBudget = Math.max(10, Math.min(50, deadline - Date.now()));
       await withState(directory, targetSession, (state) => {
         if (state.taskHalt && state.taskHalt.id === haltId) {
           state.taskHalt.goalPaused = Boolean(pauseRes.paused);
@@ -556,7 +595,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
           state.taskHalt.hostError = null;
           record(state, 'host_goal_paused', Date.now(), { halt: state.taskHalt.id, session: state.session, hasGoal: pauseRes.hasGoal });
         }
-      }).catch(() => {});
+      }, { lockTimeoutMs: remStateBudget }).catch(() => {});
       const hostNote = pauseRes.hasGoal ? ' (host active goal paused)' : ' (no active host goal)';
       if (hookOutput && typeof hookOutput === 'object') {
         for (const key of ['reason', 'systemMessage']) {
@@ -569,6 +608,7 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
         }
       }
     } catch (error) {
+      const remStateBudget = Math.max(10, Math.min(50, deadline - Date.now()));
       await withState(directory, targetSession, (state) => {
         if (state.taskHalt && state.taskHalt.id === haltId) {
           state.taskHalt.goalPaused = false;
@@ -576,15 +616,19 @@ export async function handleHook(event, directory, now = Date.now(), draw = rand
           state.taskHalt.hostError = error.message;
           record(state, 'host_goal_pause_failed', Date.now(), { halt: state.taskHalt.id, session: state.session, error: error.message });
         }
-      }).catch(() => {});
+      }, { lockTimeoutMs: remStateBudget }).catch(() => {});
       const hostWarning = ` CRITICAL HOST GOAL WARNING: Automatic goal pause failed (${error.message}). The active goal may continue scheduling turns unless manually stopped or paused by user.`;
       if (hookOutput && typeof hookOutput === 'object') {
-        if (hookOutput.reason) hookOutput.reason += hostWarning;
-        if (hookOutput.hookSpecificOutput?.permissionDecisionReason) {
+        if (hookOutput.reason && !hookOutput.reason.includes('CRITICAL HOST GOAL WARNING')) {
+          hookOutput.reason += hostWarning;
+        }
+        if (hookOutput.hookSpecificOutput?.permissionDecisionReason && !hookOutput.hookSpecificOutput.permissionDecisionReason.includes('CRITICAL HOST GOAL WARNING')) {
           hookOutput.hookSpecificOutput.permissionDecisionReason += hostWarning;
         }
         if (hookOutput.systemMessage) {
-          hookOutput.systemMessage += hostWarning;
+          if (!hookOutput.systemMessage.includes('CRITICAL HOST GOAL WARNING')) {
+            hookOutput.systemMessage += hostWarning;
+          }
         } else if (event.hook_event_name !== 'PreToolUse' || hookOutput.hookSpecificOutput?.permissionDecision === 'deny') {
           hookOutput.systemMessage = `ModelTrace Guard:${hostWarning}`;
         }

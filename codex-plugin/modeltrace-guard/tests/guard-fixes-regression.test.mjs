@@ -701,3 +701,393 @@ test('busy Stop completes well within 5-second budget and reports goal pause fai
   assert.ok(stop.reason?.includes('CRITICAL HOST GOAL WARNING: Automatic goal pause failed (app-server timed out)'));
   assert.ok(elapsed < 3500, `Execution took ${elapsed}ms, which must be well under the 5000ms hook timeout`);
 });
+
+test('busy lock PreToolUse fallback rejects consecutive canary requests without modifying state', { timeout: 10000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'data');
+  const sessionId = 'session-busy-canary';
+
+  await withState(dataDir, sessionId, (s) => {
+    s.enabled = true;
+    s.turn = 'turn-canary-1';
+    s.taskHalt = {
+      id: 'telemetry-halt-canary',
+      at: 1000,
+      source: 'telemetry',
+      expected: 'gpt-6.1-sol',
+      actual: 'gpt-5.6-luna',
+      retryCount: 2,
+      reason: 'Safety Buffering',
+      attempt: 1,
+      maxAttempts: 3,
+      durationMs: 900000,
+      pausedUntil: 2000,
+      canaryActive: false,
+      exhausted: false,
+    };
+  });
+
+  const lockFile = sessionPath(dataDir, sessionId) + '.lock';
+  await writeFile(lockFile, JSON.stringify({ pid: process.pid, nonce: randomUUID(), at: Date.now() }));
+
+  const now = 2500;
+
+  const res1 = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-canary-1', tool_name: 'Bash', tool_input: { command: 'echo canary-1' } },
+    dataDir, now, undefined, { dependencies: {} }
+  );
+  assert.equal(res1.hookSpecificOutput?.permissionDecision, 'deny', 'Busy PreToolUse must not authorize canary');
+  assert.ok(res1.systemMessage?.includes('ModelTrace Guard: STOP THE ORIGINAL TASK NOW'));
+
+  const res2 = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-canary-1', tool_name: 'Bash', tool_input: { command: 'echo canary-2' } },
+    dataDir, now + 10, undefined, { dependencies: {} }
+  );
+  assert.equal(res2.hookSpecificOutput?.permissionDecision, 'deny', 'Consecutive busy PreToolUse must also be denied');
+
+  const stateUnderLock = await readState(dataDir, sessionId);
+  assert.equal(stateUnderLock.taskHalt?.canaryActive, false, 'canaryActive must not be consumed by busy fallback');
+
+  await rm(lockFile, { force: true });
+
+  const res3 = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-canary-1', tool_name: 'Bash', tool_input: { command: 'echo canary-3' } },
+    dataDir, now + 20, undefined, { dependencies: {} }
+  );
+  assert.equal(res3.hookSpecificOutput?.permissionDecision, undefined, 'Normal lock must allow the single trial canary');
+  const finalState = await readState(dataDir, sessionId);
+  assert.equal(finalState.taskHalt?.canaryActive, true, 'canaryActive is now marked true');
+});
+
+test('query failure after canary trial preserves canaryActive, and recovery to empty db does not re-grant canary', { timeout: 10000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'data');
+  const dbFile = path.join(dir, 'test_logs.sqlite');
+  initTestDb(dbFile);
+  const sessionId = 'session-canary-fail-empty';
+  const env = { CODEX_LOGS_DB: dbFile };
+
+  await withState(dataDir, sessionId, (s) => {
+    s.enabled = true;
+    s.turn = 'turn-1';
+    s.taskHalt = {
+      id: 'telemetry-halt-probe',
+      at: 1000,
+      source: 'telemetry',
+      expected: 'gpt-6.1-sol',
+      actual: 'gpt-5.6-luna',
+      retryCount: 2,
+      reason: 'Safety Buffering',
+      attempt: 1,
+      maxAttempts: 3,
+      durationMs: 900000,
+      pausedUntil: 2000,
+      canaryActive: false,
+      exhausted: false,
+    };
+  });
+
+  const pre1 = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-1', tool_name: 'Bash', tool_input: { command: 'echo trial' } },
+    dataDir, 2500, undefined, { env }
+  );
+  assert.equal(pre1.hookSpecificOutput?.permissionDecision, undefined, 'Canary permitted');
+  const stateAfterPre = await readState(dataDir, sessionId);
+  assert.equal(stateAfterPre.taskHalt?.canaryActive, true, 'Canary active');
+
+  const corruptEnv = { CODEX_LOGS_DB: path.join(dir, 'nonexistent_invalid.sqlite') };
+  const postFail = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PostToolUse', turn_id: 'turn-1' },
+    dataDir, 2510, undefined, { env: corruptEnv }
+  );
+  assert.ok(postFail.systemMessage?.includes('CRITICAL TELEMETRY COVERAGE GAP') || postFail.systemMessage?.includes('遥测检查失败'), 'Reports gap');
+  const stateAfterFail = await readState(dataDir, sessionId);
+  assert.equal(stateAfterFail.taskHalt?.canaryActive, true, 'Query failure MUST NOT reset canaryActive to false');
+  assert.ok(stateAfterFail.lastTelemetryGap, 'Coverage gap recorded');
+
+  const postRecover = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PostToolUse', turn_id: 'turn-1' },
+    dataDir, 2520, undefined, { env }
+  );
+  const stateAfterRecover = await readState(dataDir, sessionId);
+  assert.equal(stateAfterRecover.lastTelemetryGap, null, 'Gap cleared on recovery');
+  assert.equal(stateAfterRecover.taskHalt?.canaryActive, true, 'canaryActive still true because no new healthy record');
+
+  const pre2 = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-1', tool_name: 'Bash', tool_input: { command: 'echo second-tool' } },
+    dataDir, 2530, undefined, { env }
+  );
+  assert.equal(pre2.hookSpecificOutput?.permissionDecision, 'deny', 'Must not re-grant canary when db is empty');
+  assert.ok(pre2.hookSpecificOutput?.permissionDecisionReason?.includes('STOP THE ORIGINAL TASK NOW'));
+});
+
+test('end-to-end deadline budget bounds slow connect, slow RPCs, and slow cleanup', { timeout: 10000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'data');
+  const sessionId = 'session-slow-stages';
+
+  await withState(dataDir, sessionId, (s) => {
+    s.enabled = true;
+    s.turn = 'turn-slow';
+    s.taskHalt = {
+      id: 'telemetry-halt-slow',
+      at: 1000,
+      source: 'telemetry',
+      expected: 'gpt-6.1-sol',
+      actual: 'gpt-5.6-luna',
+      retryCount: 2,
+      reason: 'Safety Buffering',
+      attempt: 1,
+      maxAttempts: 3,
+      durationMs: 900000,
+      pausedUntil: 901000,
+      canaryActive: false,
+      exhausted: false,
+    };
+  });
+
+  const slowMockClient = {
+    async request(method, params, timeout) {
+      await new Promise((r) => setTimeout(r, 200));
+      if (method === 'thread/goal/get') {
+        return { goal: { id: 'goal-1', status: 'active' } };
+      }
+      if (method === 'thread/goal/set') {
+        return { goal: { id: 'goal-1', status: 'paused' } };
+      }
+      return {};
+    },
+    async close() {
+      await new Promise((r) => setTimeout(r, 1000));
+    },
+  };
+
+  const dependencies = {
+    connect: async () => {
+      await new Promise((r) => setTimeout(r, 200));
+      return slowMockClient;
+    },
+    hookTimeoutMs: 500,
+  };
+
+  const start = performance.now();
+  const stopRes = await handleHook(
+    { session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-slow' },
+    dataDir, 1010, undefined, { dependencies }
+  );
+  const elapsed = performance.now() - start;
+
+  assert.equal(stopRes.continue, false, 'Must command continue: false');
+  assert.equal(stopRes.decision, 'block', 'Initial delivery must block');
+  assert.ok(elapsed < 800, `Execution took ${elapsed}ms, which must be well bounded by 500ms budget + small buffer`);
+  assert.ok(stopRes.reason?.includes('CRITICAL HOST GOAL WARNING: Automatic goal pause failed'), 'Reports unconfirmed pause');
+  assert.ok(stopRes.reason?.includes('timed out'), 'Explicitly indicates timeout');
+
+  const state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt?.goalPaused, false, 'Goal pause must be reported unconfirmed');
+  assert.equal(state.taskHalt?.hostConfirmed, false);
+});
+
+test('legacy cursor from subagent is migrated to subagent and does not shadow earlier degraded record of root session', { timeout: 10000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'data');
+  const dbFile = path.join(dir, 'test_logs.sqlite');
+  initTestDb(dbFile);
+
+  const rootSession = 'session-root-upgrade';
+  const subagentSession = 'session-subagent-upgrade';
+  const env = { CODEX_LOGS_DB: dbFile, MODELTRACE_TELEMETRY_HALT_COUNT: '1' };
+
+  insertTestLog(dbFile, {
+    id: 200,
+    ts: 2000,
+    threadId: subagentSession,
+    body: 'method=POST status=200 path=/responses headers={"x-codex-safety-buffering-enabled": "false"} model="gpt-6.1-sol"',
+  });
+
+  insertTestLog(dbFile, {
+    id: 150,
+    ts: 1500,
+    threadId: rootSession,
+    body: 'method=POST status=200 path=/responses headers={"x-codex-safety-buffering-enabled": "true", "x-codex-faster-model-used": "gpt-5.6-luna"} model="gpt-6.1-sol"',
+  });
+
+  await withState(dataDir, rootSession, (s) => {
+    s.enabled = true;
+    s.model = 'gpt-6.1-sol';
+    s.expected = 'gpt-6.1-sol';
+    s.subagentSessionIds = [subagentSession];
+    s.lastSqliteLogId = 200;
+    s.lastTelemetry = {
+      sessionId: subagentSession,
+      logId: 200,
+      degraded: false,
+      requestedModel: 'gpt-6.1-sol',
+      fasterModel: null,
+    };
+    delete s.lastSqliteLogIds;
+  });
+
+  const preRes = await handleHook(
+    { session_id: rootSession, hook_event_name: 'PreToolUse', turn_id: 'turn-root-1', tool_name: 'Bash', tool_input: { command: 'echo work' } },
+    dataDir, 2100, undefined, { env }
+  );
+
+  const stateAfter = await readState(dataDir, rootSession);
+  assert.equal(stateAfter.lastSqliteLogIds?.[subagentSession], 200, 'Subagent cursor retained at 200');
+  assert.equal(stateAfter.lastSqliteLogIds?.[rootSession], 150, 'Root session cursor established at 150');
+  assert.equal(stateAfter.taskHalt?.source, 'telemetry', 'Root session must halt on degraded record 150');
+  assert.equal(preRes.hookSpecificOutput?.permissionDecision, 'deny', 'PreToolUse must be denied for degraded root session');
+
+  const unconfirmedRoot = 'session-root-unconfirmed';
+  insertTestLog(dbFile, {
+    id: 250,
+    ts: 2500,
+    threadId: unconfirmedRoot,
+    body: 'method=POST status=200 path=/responses headers={"x-codex-safety-buffering-enabled": "true", "x-codex-faster-model-used": "gpt-5.6-luna"} model="gpt-6.1-sol"',
+  });
+  await withState(dataDir, unconfirmedRoot, (s) => {
+    s.enabled = true;
+    s.model = 'gpt-6.1-sol';
+    s.expected = 'gpt-6.1-sol';
+    s.lastSqliteLogId = 300;
+    s.lastTelemetry = null;
+    delete s.lastSqliteLogIds;
+  });
+
+  const unconfirmedRes = await handleHook(
+    { session_id: unconfirmedRoot, hook_event_name: 'PreToolUse', turn_id: 'turn-unconfirmed-1', tool_name: 'Bash', tool_input: { command: 'echo work' } },
+    dataDir, 2600, undefined, { env }
+  );
+  const unconfirmedState = await readState(dataDir, unconfirmedRoot);
+  assert.equal(unconfirmedState.lastSqliteLogIds?.[unconfirmedRoot], 250, 'Root session cursor established at 250');
+  assert.equal(unconfirmedState.taskHalt?.source, 'telemetry', 'Must not skip root session record when cursor source was unconfirmed');
+  assert.equal(unconfirmedRes.hookSpecificOutput?.permissionDecision, 'deny');
+});
+
+test('adaptive stage budgeting allows fast pause operations to succeed with small total budget', { timeout: 10000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'data');
+  const sessionId = '00000000-0000-0000-0000-000000000001';
+
+  await withState(dataDir, sessionId, (s) => {
+    s.enabled = true;
+    s.turn = 'turn-fast-small-budget';
+    s.taskHalt = {
+      id: 'telemetry-halt-fast',
+      at: 1000,
+      source: 'telemetry',
+      expected: 'gpt-6.1-sol',
+      actual: 'gpt-5.6-luna',
+      retryCount: 2,
+      reason: 'Safety Buffering',
+      attempt: 1,
+      maxAttempts: 3,
+      durationMs: 900000,
+      pausedUntil: 901000,
+      canaryActive: false,
+      exhausted: false,
+    };
+  });
+
+  const fastMockClient = {
+    async request(method, params, timeout) {
+      await new Promise((r) => setTimeout(r, 20));
+      if (method === 'thread/goal/get') {
+        return { goal: { id: 'goal-1', status: 'active' } };
+      }
+      if (method === 'thread/goal/set') {
+        return { goal: { id: 'goal-1', status: 'paused' } };
+      }
+      return {};
+    },
+    async close() {
+      await new Promise((r) => setTimeout(r, 10));
+    },
+  };
+
+  const dependencies = {
+    connect: async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      return fastMockClient;
+    },
+    hookTimeoutMs: 350,
+  };
+
+  const start = performance.now();
+  const stopRes = await handleHook(
+    { session_id: sessionId, hook_event_name: 'Stop', turn_id: 'turn-fast-small-budget' },
+    dataDir, 1010, undefined, { dependencies }
+  );
+  const elapsed = performance.now() - start;
+
+  assert.equal(stopRes.continue, false);
+  assert.equal(stopRes.decision, 'block');
+  assert.ok(elapsed < 600, `Execution took ${elapsed}ms, bounded by small budget`);
+  const state = await readState(dataDir, sessionId);
+  assert.equal(state.taskHalt?.goalPaused, true, 'Goal pause must succeed under tight budget with fast stages');
+  assert.equal(state.taskHalt?.hostConfirmed, true);
+});
+
+test('connect timeout triggers cleanup on late-resolving client to prevent orphan process leaks', { timeout: 10000 }, async (t) => {
+  const { pauseThreadGoal } = await import('../scripts/app-server-client.mjs');
+  let closed = false;
+  let killed = false;
+  const mockChild = {
+    kill() { killed = true; }
+  };
+  const mockClient = {
+    child: mockChild,
+    async close() { closed = true; }
+  };
+  const lateConnect = async () => {
+    await new Promise((r) => setTimeout(r, 50));
+    return mockClient;
+  };
+
+  let caughtError = null;
+  try {
+    await pauseThreadGoal('00000000-0000-0000-0000-000000000002', process.env, {
+      connect: lateConnect,
+      hookTimeoutMs: 60,
+    });
+  } catch (err) {
+    caughtError = err;
+  }
+  assert.ok(caughtError !== null);
+  assert.ok(caughtError.message.includes('timed out'));
+
+  // Wait for late connect to resolve
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(closed === true || killed === true, 'Late-resolving client must be cleaned up to prevent process leak');
+});
+
+test('slow SQLite queries respect the hook deadline budget without exceeding total timeout', { timeout: 10000 }, async (t) => {
+  const dir = await tempDir(t);
+  const dataDir = path.join(dir, 'data');
+  const dbFile = path.join(dir, 'test_logs.sqlite');
+  initTestDb(dbFile);
+  const sessionId = 'session-sqlite-slow';
+
+  await withState(dataDir, sessionId, (s) => {
+    s.enabled = true;
+    s.turn = 'turn-sqlite-slow';
+  });
+
+  const slowExecFn = async (dbPath, sql, options) => {
+    await new Promise((r) => setTimeout(r, options?.timeout ? options.timeout + 100 : 2500));
+    throw new Error('sqlite query timed out');
+  };
+
+  const start = performance.now();
+  const res = await handleHook(
+    { session_id: sessionId, hook_event_name: 'PreToolUse', turn_id: 'turn-sqlite-slow', tool_name: 'Bash', tool_input: { command: 'echo hi' } },
+    dataDir, 1000, undefined, { dependencies: { hookTimeoutMs: 400 }, env: { CODEX_LOGS_DB: dbFile } }
+  );
+  const elapsed = performance.now() - start;
+
+  assert.ok(elapsed < 1000, `Execution took ${elapsed}ms, bounded by deadline`);
+  const state = await readState(dataDir, sessionId);
+  assert.ok(state.lastTelemetryGap !== undefined);
+});
+

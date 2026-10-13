@@ -121,27 +121,109 @@ export async function openAppServer(env = process.env, protocolOptions = {}) {
 
 const CODEX_UUID_REGEX = /^(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+async function withTimeout(promiseOrFn, ms, opName = 'Operation') {
+  if (ms <= 0) {
+    throw new Error(`${opName} timed out (deadline exceeded)`);
+  }
+  let timer;
+  try {
+    const promise = typeof promiseOrFn === 'function' ? promiseOrFn() : promiseOrFn;
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${opName} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function pauseThreadGoal(session, env = process.env, dependencies = {}) {
   const isCustomConnect = Boolean(dependencies.client || dependencies.connect);
   if (!isCustomConnect && !CODEX_UUID_REGEX.test(session)) {
     return { hasGoal: false, paused: true, previousStatus: null, goal: null };
   }
-  const timeout = dependencies.timeoutMs || 4000;
+  const hookTimeoutMs = dependencies.hookTimeoutMs ?? dependencies.deadlineMs ?? dependencies.timeoutMs ?? Number(env?.MODELTRACE_HOOK_DEADLINE_MS || 4000);
+  const deadline = dependencies.deadline ?? (Date.now() + hookTimeoutMs);
   const connect = dependencies.connect || ((e) => openAppServer(e, { enforceAllowedTurns: false }));
-  const client = dependencies.client || await connect(env);
+
+  let client;
+  let connectTimedOut = false;
+  if (dependencies.client) {
+    client = dependencies.client;
+  } else {
+    const remConnect = deadline - Date.now();
+    if (remConnect <= 0) {
+      throw new Error('App-server initialization timed out (deadline exceeded)');
+    }
+    const reserveAfterConnect = Math.min(300, Math.max(60, Math.floor(remConnect * 0.3)));
+    const connectBudget = remConnect - reserveAfterConnect;
+    const connectPromise = Promise.resolve().then(() => connect(env));
+    connectPromise.then(
+      (c) => {
+        if (connectTimedOut && c) {
+          try { c.close().catch(() => {}); } catch {}
+          try { c.child?.kill?.(); } catch {}
+        }
+      },
+      () => {}
+    );
+    try {
+      client = await withTimeout(() => connectPromise, connectBudget, 'App-server initialization');
+    } catch (err) {
+      connectTimedOut = true;
+      throw err;
+    }
+  }
+
   try {
-    const getRes = await client.request('thread/goal/get', { threadId: session }, timeout);
+    const remGet = deadline - Date.now();
+    if (remGet <= 0) {
+      throw new Error('Codex thread/goal/get timed out (deadline exceeded)');
+    }
+    const reserveAfterGet = Math.min(200, Math.max(40, Math.floor(remGet * 0.3)));
+    const getBudget = remGet - reserveAfterGet;
+    const getRes = await withTimeout(
+      () => client.request('thread/goal/get', { threadId: session }, getBudget),
+      getBudget,
+      'Codex thread/goal/get'
+    );
     const currentGoal = getRes?.goal;
     if (!currentGoal || currentGoal.status === 'paused' || currentGoal.status === 'complete' || currentGoal.status === 'abandoned') {
       return { hasGoal: Boolean(currentGoal), paused: true, previousStatus: currentGoal?.status || null, goal: currentGoal || null };
     }
-    const setRes = await client.request('thread/goal/set', { threadId: session, status: 'paused' }, timeout);
+
+    const remSet = deadline - Date.now();
+    if (remSet <= 0) {
+      throw new Error('Codex thread/goal/set timed out (deadline exceeded)');
+    }
+    const reserveAfterSet = Math.min(100, Math.max(20, Math.floor(remSet * 0.3)));
+    const setBudget = remSet - reserveAfterSet;
+    const setRes = await withTimeout(
+      () => client.request('thread/goal/set', { threadId: session, status: 'paused' }, setBudget),
+      setBudget,
+      'Codex thread/goal/set'
+    );
     if (setRes?.goal?.status !== 'paused') {
       throw new Error(`Host goal pause unconfirmed: status is ${setRes?.goal?.status || 'unknown'}`);
     }
     return { hasGoal: true, paused: true, previousStatus: currentGoal.status, goal: setRes.goal };
   } finally {
-    if (!dependencies.client) await client.close();
+    if (!dependencies.client && client) {
+      const remClose = deadline - Date.now() - 20;
+      const closeBudget = Math.max(20, Math.min(200, remClose));
+      try {
+        if (remClose <= 0) {
+          try { client.child?.kill?.(); } catch {}
+          client.close().catch(() => {});
+        } else {
+          await withTimeout(() => client.close(), closeBudget, 'App-server client cleanup');
+        }
+      } catch {
+        try { client.child?.kill?.(); } catch {}
+      }
+    }
   }
 }
 
@@ -150,24 +232,88 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
   if (!isCustomConnect && !CODEX_UUID_REGEX.test(session)) {
     return { hasGoal: false, resumed: false, goal: null };
   }
-  const timeout = dependencies.timeoutMs || 4000;
+  const hookTimeoutMs = dependencies.hookTimeoutMs ?? dependencies.deadlineMs ?? dependencies.timeoutMs ?? Number(env?.MODELTRACE_HOOK_DEADLINE_MS || 4000);
+  const deadline = dependencies.deadline ?? (Date.now() + hookTimeoutMs);
   const connect = dependencies.connect || ((e) => openAppServer(e, { enforceAllowedTurns: false }));
-  const client = dependencies.client || await connect(env);
+
+  let client;
+  let connectTimedOut = false;
+  if (dependencies.client) {
+    client = dependencies.client;
+  } else {
+    const remConnect = deadline - Date.now();
+    if (remConnect <= 0) {
+      throw new Error('App-server initialization timed out (deadline exceeded)');
+    }
+    const reserveAfterConnect = Math.min(300, Math.max(60, Math.floor(remConnect * 0.3)));
+    const connectBudget = remConnect - reserveAfterConnect;
+    const connectPromise = Promise.resolve().then(() => connect(env));
+    connectPromise.then(
+      (c) => {
+        if (connectTimedOut && c) {
+          try { c.close().catch(() => {}); } catch {}
+          try { c.child?.kill?.(); } catch {}
+        }
+      },
+      () => {}
+    );
+    try {
+      client = await withTimeout(() => connectPromise, connectBudget, 'App-server initialization');
+    } catch (err) {
+      connectTimedOut = true;
+      throw err;
+    }
+  }
+
   try {
-    const getRes = await client.request('thread/goal/get', { threadId: session }, timeout);
+    const remGet = deadline - Date.now();
+    if (remGet <= 0) {
+      throw new Error('Codex thread/goal/get timed out (deadline exceeded)');
+    }
+    const reserveAfterGet = Math.min(200, Math.max(40, Math.floor(remGet * 0.3)));
+    const getBudget = remGet - reserveAfterGet;
+    const getRes = await withTimeout(
+      () => client.request('thread/goal/get', { threadId: session }, getBudget),
+      getBudget,
+      'Codex thread/goal/get'
+    );
     const currentGoal = getRes?.goal;
     if (!currentGoal) return { hasGoal: false, resumed: false, goal: null };
     if (currentGoal.status === 'active') return { hasGoal: true, resumed: true, goal: currentGoal };
     if (currentGoal.status === 'complete' || currentGoal.status === 'abandoned') {
       return { hasGoal: true, resumed: false, goal: currentGoal, reason: `Goal is already ${currentGoal.status}` };
     }
-    const setRes = await client.request('thread/goal/set', { threadId: session, status: 'active' }, timeout);
+
+    const remSet = deadline - Date.now();
+    if (remSet <= 0) {
+      throw new Error('Codex thread/goal/set timed out (deadline exceeded)');
+    }
+    const reserveAfterSet = Math.min(100, Math.max(20, Math.floor(remSet * 0.3)));
+    const setBudget = remSet - reserveAfterSet;
+    const setRes = await withTimeout(
+      () => client.request('thread/goal/set', { threadId: session, status: 'active' }, setBudget),
+      setBudget,
+      'Codex thread/goal/set'
+    );
     if (setRes?.goal?.status !== 'active') {
       throw new Error(`Host goal resume unconfirmed: status is ${setRes?.goal?.status || 'unknown'}`);
     }
     return { hasGoal: true, resumed: true, goal: setRes.goal };
   } finally {
-    if (!dependencies.client) await client.close();
+    if (!dependencies.client && client) {
+      const remClose = deadline - Date.now() - 20;
+      const closeBudget = Math.max(20, Math.min(200, remClose));
+      try {
+        if (remClose <= 0) {
+          try { client.child?.kill?.(); } catch {}
+          client.close().catch(() => {});
+        } else {
+          await withTimeout(() => client.close(), closeBudget, 'App-server client cleanup');
+        }
+      } catch {
+        try { client.child?.kill?.(); } catch {}
+      }
+    }
   }
 }
 
