@@ -197,8 +197,8 @@ export async function runQuery(dbPath, sql, options = {}) {
     try {
       const fallbackTimeout = Math.min(options.timeout ?? 2000, remFallback);
       return await runQueryWithNodeSqlite(dbPath, sql, { ...options, timeout: fallbackTimeout });
-    } catch {
-      throw cliErr;
+    } catch (nodeErr) {
+      throw nodeErr || cliErr;
     }
   }
 }

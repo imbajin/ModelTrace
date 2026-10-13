@@ -32,7 +32,11 @@ export class AppServerClient {
     this.child = child; this.nextId = 0; this.pending = new Map(); this.listeners = new Set(); this.closed = false; this.allowedTurns = new Set(); this.failure = null;
     this.enforceAllowedTurns = protocolOptions.enforceAllowedTurns ?? true;
     const rejectPending = (error) => {
-      for (const waiting of this.pending.values()) { clearTimeout(waiting.timer); waiting.reject(error); }
+      for (const waiting of this.pending.values()) {
+        clearTimeout(waiting.timer);
+        if (waiting.onAbort && waiting.signal) waiting.signal.removeEventListener('abort', waiting.onAbort);
+        waiting.reject(error);
+      }
       this.pending.clear();
     };
     const fail = (error) => {
@@ -121,6 +125,7 @@ export class AppServerClient {
   }
   async close(timeoutMs) {
     if (this.closed) return;
+    if (this.closing) return this.exited;
     this.closing = true;
     try { this.child.stdin.end(); } catch {}
     let timer;
@@ -133,17 +138,33 @@ export class AppServerClient {
     await Promise.race([this.exited, new Promise((resolve) => { timer = setTimeout(resolve, gracefulMs); })]);
     clearTimeout(timer);
     if (!this.closed) {
-      try { this.child.kill(); } catch {}
+      try { this.child.kill('SIGTERM'); } catch {}
     }
     await Promise.race([this.exited, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Could not confirm temporary Codex process cleanup')), exitMs);
+      timer = setTimeout(() => {
+        try { this.child.kill('SIGKILL'); } catch {}
+        reject(new Error('Could not confirm temporary Codex process cleanup'));
+      }, exitMs);
     })]).finally(() => clearTimeout(timer));
     this.lines?.close();
   }
 }
 
 export async function openAppServer(env = process.env, protocolOptions = {}) {
+  if (protocolOptions.signal?.aborted) {
+    throw new Error('App-server initialization aborted');
+  }
+  const deadline = protocolOptions.deadline;
+  if (deadline && Date.now() >= deadline) {
+    throw new Error('App-server initialization timed out (deadline exceeded)');
+  }
   const executable = await codexExecutable(env);
+  if (protocolOptions.signal?.aborted) {
+    throw new Error('App-server initialization aborted');
+  }
+  if (deadline && Date.now() >= deadline) {
+    throw new Error('App-server initialization timed out (deadline exceeded)');
+  }
   const child = spawn(executable, ['app-server', '--stdio'], {
     windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...env, MODELTRACE_PROBE_PROCESS: '1' },
@@ -152,7 +173,6 @@ export async function openAppServer(env = process.env, protocolOptions = {}) {
   if (typeof protocolOptions.onClient === 'function') {
     try { protocolOptions.onClient(client); } catch {}
   }
-  const deadline = protocolOptions.deadline;
   const rem = deadline ? deadline - Date.now() : 15000;
   const initTimeout = protocolOptions.timeout !== undefined ? Math.min(protocolOptions.timeout, rem) : rem;
   if (initTimeout <= 0) {
@@ -183,7 +203,8 @@ export async function openAppServer(env = process.env, protocolOptions = {}) {
     return client;
   } catch (error) {
     client.destroy(error);
-    await client.close(100).catch(() => {});
+    const remClose = deadline ? Math.max(20, Math.min(200, deadline - Date.now() - 20)) : 100;
+    await client.close(remClose).catch(() => {});
     throw error;
   } finally {
     if (protocolOptions.signal && onAbort) {
@@ -246,8 +267,8 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
       (c) => {
         if (connectTimedOut && c) {
           try { c.destroy?.(); } catch {}
-          try { c.child?.kill?.(); } catch {}
-          try { c.close?.().catch(() => {}); } catch {}
+          try { c.child?.kill?.('SIGKILL'); } catch {}
+          try { c.close?.(100).catch(() => {}); } catch {}
         }
       },
       () => {}
@@ -259,8 +280,13 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
       abortController.abort();
       if (spawnedClient) {
         try { spawnedClient.destroy?.(err); } catch {}
-        try { spawnedClient.child?.kill?.(); } catch {}
-        try { spawnedClient.close?.(100).catch(() => {}); } catch {}
+        try { spawnedClient.child?.kill?.('SIGKILL'); } catch {}
+        const remClose = Math.max(20, Math.min(200, deadline - Date.now() - 20));
+        try {
+          await withTimeout(() => spawnedClient.close(remClose), remClose, 'App-server client cleanup');
+        } catch {
+          try { spawnedClient.child?.kill?.('SIGKILL'); } catch {}
+        }
       }
       throw err;
     }
@@ -308,14 +334,14 @@ export async function pauseThreadGoal(session, env = process.env, dependencies =
       try {
         if (remClose <= 0) {
           try { client.destroy?.(); } catch {}
-          try { client.child?.kill?.(); } catch {}
+          try { client.child?.kill?.('SIGKILL'); } catch {}
           client.close?.(50).catch(() => {});
         } else {
           await withTimeout(() => client.close(closeBudget), closeBudget, 'App-server client cleanup');
         }
       } catch {
         try { client.destroy?.(); } catch {}
-        try { client.child?.kill?.(); } catch {}
+        try { client.child?.kill?.('SIGKILL'); } catch {}
       }
     }
   }
@@ -355,8 +381,8 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
       (c) => {
         if (connectTimedOut && c) {
           try { c.destroy?.(); } catch {}
-          try { c.child?.kill?.(); } catch {}
-          try { c.close?.().catch(() => {}); } catch {}
+          try { c.child?.kill?.('SIGKILL'); } catch {}
+          try { c.close?.(100).catch(() => {}); } catch {}
         }
       },
       () => {}
@@ -368,8 +394,13 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
       abortController.abort();
       if (spawnedClient) {
         try { spawnedClient.destroy?.(err); } catch {}
-        try { spawnedClient.child?.kill?.(); } catch {}
-        try { spawnedClient.close?.(100).catch(() => {}); } catch {}
+        try { spawnedClient.child?.kill?.('SIGKILL'); } catch {}
+        const remClose = Math.max(20, Math.min(200, deadline - Date.now() - 20));
+        try {
+          await withTimeout(() => spawnedClient.close(remClose), remClose, 'App-server client cleanup');
+        } catch {
+          try { spawnedClient.child?.kill?.('SIGKILL'); } catch {}
+        }
       }
       throw err;
     }
@@ -419,14 +450,14 @@ export async function resumeThreadGoal(session, env = process.env, dependencies 
       try {
         if (remClose <= 0) {
           try { client.destroy?.(); } catch {}
-          try { client.child?.kill?.(); } catch {}
+          try { client.child?.kill?.('SIGKILL'); } catch {}
           client.close?.(50).catch(() => {});
         } else {
           await withTimeout(() => client.close(closeBudget), closeBudget, 'App-server client cleanup');
         }
       } catch {
         try { client.destroy?.(); } catch {}
-        try { client.child?.kill?.(); } catch {}
+        try { client.child?.kill?.('SIGKILL'); } catch {}
       }
     }
   }

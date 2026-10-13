@@ -1109,6 +1109,7 @@ test('real hook CLI regression: slow app-server initialization cancels request, 
   const scriptContent = `#!/usr/bin/env node
 import fs from 'node:fs';
 fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+process.on('SIGTERM', () => {}); // Ignore SIGTERM to verify SIGKILL cleanup
 process.stdin.resume();
 `;
   await writeFile(slowScript, scriptContent, { mode: 0o755 });
@@ -1164,18 +1165,15 @@ process.stdin.resume();
 
   assert.equal(exitCode, 0, 'Hook CLI process must exit with code 0');
   assert.ok(jsonOutputTime !== null, 'Hook CLI must output JSON to stdout');
-  assert.ok(jsonOutputTime < 3000, `JSON output time (${jsonOutputTime}ms) must be well within deadline`);
-  assert.ok(processExitTime < 4000, `Actual process exit time (${processExitTime}ms) must be well within deadline`);
+  assert.ok(jsonOutputTime < 2500, `JSON output time (${jsonOutputTime}ms) must be well within deadline`);
+  assert.ok(processExitTime < 3000, `Actual process exit time (${processExitTime}ms) must be well within deadline`);
 
   const output = JSON.parse(stdoutData.trim());
   assert.equal(output.continue, false, 'Must command continue: false');
 
-  // Verify child process was cleaned up and is not lingering
+  // Verify child process was cleaned up and is not lingering immediately upon CLI exit
   const slowPid = Number((await readFile(pidFile, 'utf8')).trim());
   assert.ok(!isNaN(slowPid) && slowPid > 0, 'Slow codex child process PID must be recorded');
-
-  // Wait a brief moment to allow signal delivery and reaping
-  await new Promise((r) => setTimeout(r, 50));
   assert.equal(isProcessAlive(slowPid), false, 'Temporary app-server process must be terminated and not linger');
 });
 
@@ -1260,6 +1258,16 @@ test('real hook CLI regression: real SQLite BEGIN EXCLUSIVE lock stacked with st
 
   const state = await readState(dataDir, sessionId);
   assert.ok(state.lastTelemetryGap !== null && state.lastTelemetryGap !== undefined, 'State must record telemetry coverage gap');
+
+  // Verify no lingering sqlite3 CLI or hook child process remains
+  if (process.platform !== 'win32') {
+    try {
+      const pgrepOut = execFileSync('pgrep', ['-f', path.basename(dbFile)], { encoding: 'utf8' }).trim();
+      assert.equal(pgrepOut, '', 'No lingering SQLite process should access test DB');
+    } catch (err) {
+      assert.equal(err.status, 1, 'pgrep must find no lingering processes');
+    }
+  }
 });
 
 
